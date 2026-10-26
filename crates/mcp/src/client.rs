@@ -13,6 +13,17 @@ use std::time::Duration;
 const DEFAULT_URL: &str = "http://127.0.0.1:44321";
 const DAEMON_LABEL: &str = "com.leeguoo.iphone-use";
 
+/// A real loopback destination, parsed before any local credential lookup.
+fn loopback_daemon_url(value: &str) -> Option<reqwest::Url> {
+    let url = reqwest::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https") { return None; }
+    let host = url.host_str()?;
+    let ip = host.strip_prefix('[').and_then(|value| value.strip_suffix(']')).unwrap_or(host);
+    let local = host.eq_ignore_ascii_case("localhost")
+        || ip.parse::<std::net::IpAddr>().is_ok_and(|address| address.is_loopback());
+    local.then_some(url)
+}
+
 /// Daemon URL and bearer token: the environment first, then the installed
 /// daemon's own LaunchAgent. The agent token wins over the password because
 /// a daemon with an agent token refuses the password as a bearer.
@@ -39,8 +50,13 @@ fn daemon_target(
     });
     let token = env("IPHONE_USE_TOKEN").or_else(|| {
         // Only a daemon on this Mac can be the one the plist describes.
-        let local =
-            base_url.starts_with("http://127.0.0.1:") || base_url.starts_with("http://localhost:");
+        let configured_port = plist(&label, "IPHONE_USE_PORT")
+            .and_then(|value| value.trim().parse::<u16>().ok())
+            .or_else(|| (label == DAEMON_LABEL).then_some(44321));
+        let local = loopback_daemon_url(&base_url).is_some_and(|url| {
+            url.username().is_empty() && url.password().is_none()
+                && url.port_or_known_default() == configured_port
+        });
         local
             .then(|| {
                 plist(&label, "IPHONE_USE_AGENT_TOKEN")
@@ -344,11 +360,17 @@ impl DaemonClient {
 
     fn http(&self) -> &Client {
         self.client.get_or_init(|| {
-            Client::builder()
+            let builder = Client::builder()
                 .connect_timeout(self.connect_timeout)
-                .timeout(self.request_timeout)
-                .build()
-                .expect("reqwest client construction is infallible")
+                .timeout(self.request_timeout);
+            // Installed daemon credentials must stay on this Mac even when
+            // the MCP host supplies HTTP_PROXY / ALL_PROXY.
+            let builder = if loopback_daemon_url(&self.base_url).is_some() {
+                builder.no_proxy()
+            } else {
+                builder
+            };
+            builder.build().expect("reqwest client construction is infallible")
         })
     }
 
@@ -1654,6 +1676,26 @@ pub(crate) mod tests {
             c.url("/agent/screenshot"),
             "http://192.168.1.50:44321/agent/screenshot"
         );
+    }
+
+    #[test]
+    fn local_credentials_require_a_parsed_loopback_host_without_userinfo() {
+        for url in ["http://127.0.0.1:44321@remote.invalid/", "http://localhost:44321@remote.invalid/",
+            "http://localhost.remote.invalid:44321", "http://user:pass@127.0.0.1:44321", "http://127.0.0.1:45432"] {
+            let (_, token) = daemon_target(|key| (key == "IPHONE_USE_URL").then(|| url.into()),
+                |_, key| (key == "IPHONE_USE_AGENT_TOKEN").then(|| "synthetic-local-secret".into()));
+            assert!(token.is_none(), "local credentials borrowed for {url}");
+        }
+        for url in ["http://127.0.0.1:44321", "http://localhost:44321", "http://[::1]:44321"] {
+            let (_, token) = daemon_target(|key| (key == "IPHONE_USE_URL").then(|| url.into()),
+                |_, key| (key == "IPHONE_USE_AGENT_TOKEN").then(|| "synthetic-local-secret".into()));
+            assert_eq!(token.as_deref(), Some("synthetic-local-secret"));
+        }
+        let (_, token) = daemon_target(|key| match key {
+            "IPHONE_USE_URL" => Some("https://remote.invalid".into()),
+            "IPHONE_USE_TOKEN" => Some("explicit-remote-token".into()), _ => None,
+        }, |_, _| None);
+        assert_eq!(token.as_deref(), Some("explicit-remote-token"));
     }
 
     #[test]

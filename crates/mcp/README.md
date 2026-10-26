@@ -512,3 +512,8 @@ snapshot, run and progress state; a concurrent call keeps its own pinned target.
 A batch or flow stays on one instance. The screen panel waits for its opening
 tool's target and sends that instance with frame and Home calls. Installed local
 LaunchAgents are supported; simulator-only records are not discovery targets.
+
+Local daemon calls bypass process/system HTTP proxies. Automatic credentials
+are loaded only for a parsed loopback URL matching the selected LaunchAgent's
+port and without URL userinfo. An explicit remote URL/token keeps its configured
+transport; a different local port requires its own explicit credentials.

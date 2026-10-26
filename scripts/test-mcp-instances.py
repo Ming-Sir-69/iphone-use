@@ -49,7 +49,7 @@ class Daemon(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
-for name in ('A', 'B'):
+for name in ('A', 'B', 'unexpected-proxy'):
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Daemon)
     server.daemon_threads = True
     server.name = name
@@ -71,7 +71,7 @@ try:
             return path
         config('default', servers[0], 'token-A')
         path_b = config('i13', servers[1], 'token-B')
-        env = {'HOME': home, 'PATH': os.environ['PATH'], 'NO_PROXY': '*',
+        env = {'HOME': home, 'PATH': os.environ['PATH'], 'NO_PROXY': '', 'no_proxy': '', 'HTTP_PROXY': f'http://127.0.0.1:{servers[2].server_port}', 'http_proxy': f'http://127.0.0.1:{servers[2].server_port}', 'HTTPS_PROXY': f'http://127.0.0.1:{servers[2].server_port}',
                'IPHONE_USE_URL': f'http://127.0.0.1:{servers[0].server_port}',
                'IPHONE_USE_TOKEN': 'ambient-token', 'IPHONE_USE_MCP_TOOLS': 'all',
                'IPHONE_USE_MCP_PREWARM': '0'}
@@ -148,6 +148,7 @@ try:
             config('i13', servers[1], 'rotated-B')
             assert 'result' in call('phone_status', instance='i13')
             assert seen[-1][0] == 'B' and seen[-1][3] == 'Bearer rotated-B'
+            assert not any(row[0] == 'unexpected-proxy' for row in seen), 'a local daemon request reached the environment proxy'
             print('MCP instances: discovery, credential isolation, snapshots, fail-closed routing and token rotation passed')
         finally:
             process.stdin.close()
