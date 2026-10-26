@@ -380,6 +380,10 @@ impl DaemonClient {
         }
     }
 
+    pub(crate) fn same_target(&self, other: &Self) -> bool {
+        self.base_url == other.base_url && self.token == other.token
+    }
+
     /// The configured base URL (used for logging).
     pub fn base_url(&self) -> &str {
         &self.base_url

@@ -814,8 +814,8 @@ worked example below.
 
 ## MCP specifics
 
-37 tools (one, `phone_screen_frame`, is hidden from the model and used only by the live screen panel): `phone_status`, `phone_screen`, `phone_capabilities`, `phone_reconnect`, `phone_hold`,
-`phone_release_owner`, `phone_login`, `phone_apps`, `phone_screenshot`, `phone_elements`, `phone_tap`,
+39 tools (one, `phone_screen_frame`, is hidden from the model and used only by the live screen panel): `phone_status`, `phone_screen`, `phone_capabilities`, `phone_reconnect`, `phone_hold`,
+`phone_release_owner`, `phone_login`, `phone_apps`, `phone_screenshot`, `phone_elements`, `phone_home_layout`, `phone_instances`, `phone_tap`,
 `phone_tap_element`, `phone_tap_label`, `phone_scroll`, `phone_scroll_find`, `phone_collect_list`, `phone_type`,
 `phone_key`, `phone_shortcut`, `phone_run_steps`, `phone_jev_run`,
 `phone_run_start`, `phone_run_end`, `phone_flow_list / info / run / draft /
@@ -873,7 +873,7 @@ update / publish / report`, and the device tools `phone_logs`, `phone_crashes`,
   tools also `destructiveHint`, `idempotentHint`). Read-only: `phone_status`,
   `phone_capabilities`, `phone_apps`, `phone_screen`, `phone_screen_frame`,
   `phone_screenshot`, `phone_elements`, `phone_crashes`, `phone_flow_list`,
-  `phone_flow_info`, `phone_flow_draft`. `phone_logs` is not read-only (its
+  `phone_flow_info`, `phone_flow_draft`, `phone_home_layout`, `phone_instances`. `phone_logs` is not read-only (its
   start/stop change the capture); `phone_install_app` is destructive.
 - `IPHONE_USE_MCP_TOOLS` picks the exposed tools: `all` (default), `readonly`
   (only the read-only set), or a comma list of tool names (unknown names are
@@ -1310,3 +1310,16 @@ explicit notification setup run, `IPU_RUNNER_EXIT_NOTICE=1` requests permission;
 use both volume keys or `iphone-use pause`. Only the notification's explicit
 End control button ends the session; tapping its body does not. Pending
 notification callbacks cannot end a later runner session.
+
+## Choosing among installed phones in MCP
+
+`phone_instances` lists local installed LaunchAgents and bounded read-only
+status without reconnecting. All other `phone_*` tools accept optional
+`instance:"i13"` or `instance:"default"`. Use it consistently through reads and
+actions; omitted instance refers only to the server's configured daemon.
+An unavailable/unsafe selection fails without another-phone fallback or reused
+ambient credentials. Each instance keeps its own snapshots, runs and progress.
+The live panel waits for its opening tool's selection and uses it for frames
+and Home; a host that does not deliver tool input/result leaves the panel
+waiting, rather than guessing another target. This selects an installed daemon;
+it never changes a daemon's phone configuration or bypasses handoff/privacy/owner gates.
