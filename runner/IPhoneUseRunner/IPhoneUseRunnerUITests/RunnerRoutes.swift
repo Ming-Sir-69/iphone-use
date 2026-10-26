@@ -315,7 +315,7 @@ extension RunnerTests {
 
   // MARK: - Element actions
 
-  /// Taps a point through synthesis, falling back to XCUICoordinate.
+  /// Taps through synthesis; uses XCUICoordinate only on pre-dispatch capability absence.
   func tapPoint(_ point: CGPoint) throws {
     let screen = windowSizePoints()
     guard screen.width <= 0 || TapBounds.onScreen(point, screen) else {
@@ -761,16 +761,15 @@ extension RunnerTests {
         "action point (\(Int(off.x)), \(Int(off.y))) is outside the \(Int(screen.width))x\(Int(screen.height)) screen; nothing was sent")
     }
     if !paths.isEmpty {
-      if let error = timed("Synthesize", { IPURBridge.synthesizeTouchPaths(paths, name: "ipu-w3c-actions") }) {
-        // A single tap can still go through the public coordinate API.
-        if paths.count == 1, let down = paths[0].first, paths[0].count == 2,
-           let x = (down["x"] as? NSNumber)?.doubleValue, let y = (down["y"] as? NSNumber)?.doubleValue {
-          try tapPoint(CGPoint(x: x, y: y))
-          used.append("xcui-coordinate")
-        } else {
-          throw RunnerError.failed("actions failed: \(error)")
-        }
+      if let point = W3CActions.coordinateTapPoint(paths) {
+        let response = try gesture("actions tap", synthesized: {
+          IPURBridge.synthesizeTouchPaths(paths, name: "ipu-w3c-actions")
+        }) { app in coordinate(app, point).tap() }
+        used.append(response.headers["X-IPU-Gesture"] ?? "unknown")
       } else {
+        if let error = timed("Synthesize", { IPURBridge.synthesizeTouchPaths(paths, name: "ipu-w3c-actions") }) {
+          throw RunnerError.failed("actions synthesis outcome unknown: \(error); no coordinate fallback attempted")
+        }
         used.append("synthesized")
       }
     }

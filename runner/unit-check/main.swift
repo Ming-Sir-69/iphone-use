@@ -70,6 +70,52 @@ do {
   check(scenario([false], activateFails: true) == ["press", "activate", "error"], "activation failure propagates")
 }
 
+// MARK: Gesture delivery and non-replay
+
+do {
+  var calls: [String] = []
+  let native = try GestureDelivery.run("tap", synthesisAvailable: true, synthesized: {
+    calls.append("delivered"); return nil
+  }, fallback: { calls.append("fallback") })
+  check(native == "synthesized" && calls == ["delivered"], "successful synthesis acts exactly once")
+
+  for error in ["timeout after delivery", "private XCTest event synthesis failed: could not create event record",
+                "private XCTest event synthesis unavailable (XCSynthesizedEventRecord / XCPointerEventPath)"] {
+    calls = []
+    expectThrows("unknown error", "a synthesis error never authorizes gesture replay") {
+      _ = try GestureDelivery.run("tap", synthesisAvailable: true, synthesized: {
+        calls.append("delivered"); return error
+      }, fallback: { calls.append("fallback") })
+    }
+    check(calls == ["delivered"], "error text cannot promote a possibly delivered gesture to safe fallback")
+  }
+  calls = []
+  let fallback = try GestureDelivery.run("tap", synthesisAvailable: false, synthesized: {
+    calls.append("synthesis"); return nil
+  }, fallback: { calls.append("fallback") })
+  check(fallback == "xcui-coordinate" && calls == ["fallback"], "missing capability selects public input before synthesis")
+  calls = []
+  expectThrows("unknown error", "coordinate failure is preserved without synthesis retry") {
+    _ = try GestureDelivery.run("tap", synthesisAvailable: false, synthesized: {
+      calls.append("synthesis"); return nil
+    }, fallback: { calls.append("fallback"); throw RunnerError.failed("coordinate timeout") })
+  }
+  check(calls == ["fallback"], "failed public input is never retried")
+
+  let down: [String: Any] = ["type":"down", "x":20.0, "y":30.0, "t":0.0]
+  let up: [String: Any] = ["type":"up", "x":20.0, "y":30.0, "t":0.05]
+  check(W3CActions.coordinateTapPoint([[down,up]]) == CGPoint(x:20,y:30), "plain W3C tap retains public fallback")
+  var held = up; held["t"] = 1.5
+  check(W3CActions.coordinateTapPoint([[down,held]]) == nil, "long hold cannot become a public tap")
+  var delayed = down; delayed["t"] = 0.02
+  check(W3CActions.coordinateTapPoint([[delayed,up]]) == nil, "delayed input cannot silently lose its pause")
+  var moved = up; moved["x"] = 40.0
+  check(W3CActions.coordinateTapPoint([[down,moved]]) == nil, "moving touch cannot become a public tap")
+  check(W3CActions.coordinateTapPoint([[down,up],[down,up]]) == nil, "multiple touches cannot collapse to one tap")
+  var invalid = up; invalid["t"] = Double.nan
+  check(W3CActions.coordinateTapPoint([[down,invalid]]) == nil, "nonfinite gesture cannot select public fallback")
+}
+
 // MARK: HTTP
 
 do {
