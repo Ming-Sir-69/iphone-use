@@ -285,6 +285,17 @@ pub fn log_shows_link_dropped(path: &Path) -> bool {
         || text.contains("A connection to this device could not be established")
 }
 
+/// The test session's link to the phone was invalidated under a live runner:
+/// `testServe() encountered an error (… communicating with a remote process.
+/// (Underlying Error: The connection was invalidated.))`. Seen on Wi-Fi tunnel
+/// drops and WARP/VPN reconnects; a recovery heuristic, not proof that nobody
+/// at the phone ended the session.
+pub fn log_shows_connection_invalidated(path: &Path) -> bool {
+    any_line(&read_log(path), |line| {
+        ordered(line, "communicating with a remote process", "The connection was invalidated")
+    })
+}
+
 pub fn log_shows_untrusted(path: &Path) -> bool {
     read_log(path).contains("not trusted")
 }
@@ -1124,6 +1135,17 @@ mod tests {
             ),
             "a missing iOS platform is not an unreachable phone"
         );
+        // A Wi-Fi tunnel drop under a live runner (hardware, iOS 27.0.1): the
+        // runner ends, but not from the phone.
+        let severed = log("Testing failed:\n\tAn error occurred while communicating with a remote process.\n\ttestServe() encountered an error (Encountered a problem with the test runner after launch. (Underlying Error: An error occurred while communicating with a remote process. (Underlying Error: The connection was invalidated.)))\n");
+        assert!(log_shows_connection_invalidated(severed.path()));
+        assert!(!log_shows_product_failure(severed.path()));
+        assert!(!log_shows_connection_invalidated(
+            log("Test Case '-[RunnerTests testServe]' failed (2.104 seconds).").path()
+        ));
+        assert!(!log_shows_connection_invalidated(
+            log("Underlying Error: The connection was invalidated.").path()
+        ));
         // What a runner that lost the race for port 8100 leaves behind: a
         // failed test, not a failed product (#265).
         let busy = log("2026-10-11 03:07:41.512+0900 IPhoneUseRunnerUITests-Runner[812:40211] ipu-runner: port 8100 on the phone is already in use \u{2014} another runner (or a previous one still exiting) holds it\n\
