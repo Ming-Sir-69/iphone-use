@@ -103,8 +103,17 @@ do {
   check(calls == ["fallback"], "failed public input is never retried")
 
   let down: [String: Any] = ["type":"down", "x":20.0, "y":30.0, "t":0.0]
-  let up: [String: Any] = ["type":"up", "x":20.0, "y":30.0, "t":0.05]
+  let up: [String: Any] = ["type":"up", "x":20.0, "y":30.0, "t":0.05, "explicitPointerUp":true]
   check(W3CActions.coordinateTapPoint([[down,up]]) == CGPoint(x:20,y:30), "plain W3C tap retains public fallback")
+  let start: [[String: Any]] = [
+    ["type":"pointerMove", "x":20.0, "y":30.0], ["type":"pointerDown"]
+  ]
+  for ending in ["pointerUp", "pointerCancel", "missing"] {
+    let actions = start + (ending == "missing" ? [] : [["type":ending]])
+    let paths = try W3CActions.pointerPaths(actions) { _ in .zero }
+    check((W3CActions.coordinateTapPoint(paths) != nil) == (ending == "pointerUp"),
+          "only explicit pointerUp permits tap fallback: \(ending)")
+  }
   var held = up; held["t"] = 1.5
   check(W3CActions.coordinateTapPoint([[down,held]]) == nil, "long hold cannot become a public tap")
   var delayed = down; delayed["t"] = 0.02

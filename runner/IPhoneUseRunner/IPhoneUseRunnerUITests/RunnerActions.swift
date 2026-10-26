@@ -39,6 +39,7 @@ enum W3CActions {
     guard paths.count == 1, paths[0].count == 2 else { return nil }
     let down = paths[0][0], up = paths[0][1]
     guard down["type"] as? String == "down", up["type"] as? String == "up",
+          up["explicitPointerUp"] as? Bool == true,
           let x = number(down, "x"), let y = number(down, "y"),
           let endX = number(up, "x"), let endY = number(up, "y"),
           let start = number(down, "t"), let end = number(up, "t"),
@@ -98,7 +99,9 @@ enum W3CActions {
       case "pointerUp", "pointerCancel":
         if let down = downAt {
           t = max(t, down + (t > down ? minimumHold : tapHold))
-          current.append(step("up", position, t))
+          var up = step("up", position, t)
+          up["explicitPointerUp"] = action["type"] as? String == "pointerUp"
+          current.append(up)
           paths.append(current)
           current = []
           downAt = nil
