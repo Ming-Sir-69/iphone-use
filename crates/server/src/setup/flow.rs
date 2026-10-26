@@ -516,6 +516,9 @@ impl Setup {
             crate::phone_exit::Reason::Exited => {
                 "the device runner was ended on the iPhone; it stays off until the next agent or web request"
             }
+            crate::phone_exit::Reason::SessionInvalidated => {
+                "the XCTest connection was invalidated; operator intent is unknown, so the runner stays off until an explicit agent or web request"
+            }
             crate::phone_exit::Reason::PasscodeCanceled => {
                 "the passcode prompt was cancelled on the iPhone; the phone stays with its holder until someone takes it back (web 「交给 agent」 or iphone-use resume)"
             }
@@ -3243,6 +3246,11 @@ impl Setup {
             }
             proc::sleep(Duration::from_secs(10))?;
         };
+        // hold already confirmed the phone was unlocked when authorization
+        // was revoked. A later lock/disconnect must not erase that exit.
+        if cause == "revoked" {
+            return self.park_on_phone(crate::phone_exit::Reason::Exited);
+        }
         // An unplugged phone takes its runner down with it. Nothing can be
         // rebuilt until it is back, so say so and wait instead.
         let absent = if self.legacy_ios.is_some() {
@@ -3274,12 +3282,12 @@ impl Setup {
         // runner lives on, refused), or the runner process ended with the
         // phone here and unlocked. Leave the phone to them; the next request
         // brings the runner back.
-        if runner_end_parks(
+        if let Some(reason) = runner_end_reason(
             cause,
-            cause == "runner" && runner::log_shows_automation_revoked(&self.ctx.run_log, log_mark),
-            cause == "runner" && runner::log_shows_connection_invalidated(&self.ctx.run_log),
+            runner::log_shows_automation_revoked(&self.ctx.run_log, log_mark),
+            runner::log_shows_connection_invalidated(&self.ctx.run_log, log_mark),
         ) {
-            return self.park_on_phone(crate::phone_exit::Reason::Exited);
+            return self.park_on_phone(reason);
         }
         match cause {
             "unreachable" => {
@@ -3345,12 +3353,16 @@ impl Setup {
     }
 }
 
-/// Whether a runner end is the person's (park) rather than the link's
-/// (rebuild). A runner that exited after its session link was invalidated is
-/// rebuilt, unless this run's log also shows the volume-key revocation, which
-/// always wins.
-fn runner_end_parks(cause: &str, revoked: bool, invalidated: bool) -> bool {
-    cause == "revoked" || (cause == "runner" && (revoked || !invalidated))
+/// An invalidated connection does not prove operator intent. Both outcomes
+/// park; only their reported evidence differs. Explicit revocation wins.
+fn runner_end_reason(cause: &str, revoked: bool, invalidated: bool) -> Option<crate::phone_exit::Reason> {
+    use crate::phone_exit::Reason;
+    match cause {
+        "revoked" => Some(Reason::Exited),
+        "runner" if revoked || !invalidated => Some(Reason::Exited),
+        "runner" => Some(Reason::SessionInvalidated),
+        _ => None,
+    }
 }
 
 /// `/status` within 4 s: `None` when it did not answer below 400, else how
@@ -3883,12 +3895,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_an_invalidated_link_turns_a_runner_end_into_a_rebuild() {
-        assert!(runner_end_parks("revoked", false, false));
-        assert!(runner_end_parks("runner", false, false), "a plain runner end parks");
-        assert!(runner_end_parks("runner", true, true), "this run's revocation wins");
-        assert!(!runner_end_parks("runner", false, true));
-        assert!(!runner_end_parks("unreachable", false, true));
+    fn session_end_evidence_never_enables_automatic_rebuild() {
+        use crate::phone_exit::Reason;
+        assert_eq!(runner_end_reason("revoked", false, true), Some(Reason::Exited));
+        assert_eq!(runner_end_reason("runner", true, true), Some(Reason::Exited));
+        assert_eq!(runner_end_reason("runner", false, false), Some(Reason::Exited));
+        assert_eq!(runner_end_reason("runner", false, true), Some(Reason::SessionInvalidated));
+        assert_eq!(runner_end_reason("unreachable", false, true), None);
     }
 
     #[test]
