@@ -56,6 +56,12 @@ For an explicit permission setup run set `IPU_RUNNER_EXIT_NOTICE=1`; `0` disable
 the notice. A denied permission leaves volume-key and pause exit available.
 Tapping the notification body does not end control. Simulator runs omit it.
 
+Notification setup is explicit: `IPU_RUNNER_EXIT_NOTICE=1 iphone-use setup`
+requests permission on this instance's Runner. Use `0` to disable the notice or
+`auto` to return to using existing permission without a prompt. The managed
+supervisor remembers this choice and forwards it through both Xcode and the
+iOS 15/16 launcher. Other instances keep their own choice.
+
 
 ## Quick start
 

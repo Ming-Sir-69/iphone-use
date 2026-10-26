@@ -2042,6 +2042,7 @@ impl Setup {
             crate::runner_token::XCODEBUILD_TOKEN_ENV.to_string(),
             token,
         )];
+        env.push(self.ctx.exit_notice_env(crate::phone_daemon::XCODEBUILD_PREFIX));
         env.extend(self.phone_daemon_env(crate::phone_daemon::XCODEBUILD_PREFIX)?);
         let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let Ok(spawned) = proc::spawn_detached_env(
@@ -4713,6 +4714,7 @@ impl Setup {
         pairs.push(("MJPEG_PORT", ctx.mjpeg_port.clone()));
         pairs.push(("IPU_RUNNER_ALLOW_LAN", ctx.allow_lan.clone()));
         pairs.push(("IPU_RUNNER_TRANSPORT", ctx.transport.clone()));
+        pairs.push(("IPU_RUNNER_EXIT_NOTICE", ctx.exit_notice_value().into()));
         // The on-phone daemon: the supervisor's relaunches must build and
         // start the same runner as this run.
         pairs.push(("IPU_EMBED", ctx.embed.clone()));
@@ -5547,6 +5549,7 @@ impl Setup {
                     );
                 };
                 let mut env = vec![(crate::runner_token::TOKEN_ENV.to_string(), token)];
+                env.push(self.ctx.exit_notice_env(""));
                 env.extend(self.phone_daemon_env("")?);
                 let env: Vec<(&str, &str)> =
                     env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();

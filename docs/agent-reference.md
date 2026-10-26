@@ -1310,3 +1310,9 @@ explicit notification setup run, `IPU_RUNNER_EXIT_NOTICE=1` requests permission;
 use both volume keys or `iphone-use pause`. Only the notification's explicit
 End control button ends the session; tapping its body does not. Pending
 notification callbacks cannot end a later runner session.
+
+Notification setup is explicit: `IPU_RUNNER_EXIT_NOTICE=1 iphone-use setup`
+requests permission on this instance's Runner. Use `0` to disable the notice or
+`auto` to return to using existing permission without a prompt. The managed
+supervisor remembers this choice and forwards it through both Xcode and the
+iOS 15/16 launcher. Other instances keep their own choice.

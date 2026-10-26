@@ -29,6 +29,10 @@ agent 或网页请求；后台定时任务和预热不会重连。`iphone-use pa
 明确设置通知权限时可用 `IPU_RUNNER_EXIT_NOTICE=1`，`0` 则禁用通知。拒绝授权后
 仍可使用音量键或 pause 退出。点通知正文不会结束控制，模拟器不显示该通知。
 
+通知权限需显式设置：`IPU_RUNNER_EXIT_NOTICE=1 iphone-use setup` 在此实例的 Runner
+中请求授权；`0` 禁用通知，`auto` 恢复为只使用已有授权、不弹权限框。受管 supervisor
+会保存选择，并传给 Xcode 和 iOS 15/16 启动器；其他实例的设置独立保留。
+
 
 ## 快速开始
 
