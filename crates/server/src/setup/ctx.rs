@@ -44,6 +44,16 @@ pub fn resolve_transport(raw: &str) -> Result<&'static str, String> {
     }
 }
 
+/// Explicit permission setup is opt-in; auto uses existing permission only.
+fn resolve_exit_notice(explicit: Option<&str>, persisted: &str) -> Result<Option<bool>, String> {
+    match explicit.unwrap_or(persisted).trim() {
+        "" | "auto" => Ok(None),
+        "0" => Ok(Some(false)),
+        "1" => Ok(Some(true)),
+        _ => Err("IPU_RUNNER_EXIT_NOTICE must be auto, 0 or 1".into()),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Ctx {
     pub instance: Instance,
@@ -92,6 +102,7 @@ pub struct Ctx {
     /// is off the cable through CoreDevice's encrypted Wi-Fi tunnel, USB
     /// preferred when both are there; `usb` requires the cable for that.
     pub transport: String,
+    pub exit_notice: Option<bool>,
     pub udid: String,
     /// `IPU_RUNNER_KEEPALIVE=1`: the launchd supervisor's run.
     pub keepalive: bool,
@@ -225,6 +236,7 @@ impl Ctx {
             asc_issuer_id: String::new(),
             allow_lan: "0".into(),
             transport: TRANSPORT_AUTO.into(),
+            exit_notice: None,
             udid: String::new(),
             keepalive: false,
             developer_dir: None,
@@ -407,9 +419,20 @@ impl Ctx {
         ctx.asc_issuer_id = asc_issuer;
         ctx.allow_lan = allow_lan;
         ctx.transport = transport;
+        ctx.exit_notice = resolve_exit_notice(std::env::var("IPU_RUNNER_EXIT_NOTICE").ok().as_deref(),
+            &runner_env("IPU_RUNNER_EXIT_NOTICE")).map_err(|message| (message, 1))?;
         ctx.udid = udid;
         ctx.recover_recorded_target();
         Ok(ctx)
+    }
+
+    pub fn exit_notice_value(&self) -> &'static str {
+        match self.exit_notice { None => "auto", Some(false) => "0", Some(true) => "1" }
+    }
+
+    /// Xcode strips TEST_RUNNER_; the legacy launcher receives the plain key.
+    pub fn exit_notice_env(&self, prefix: &str) -> (String, String) {
+        (format!("{prefix}IPU_RUNNER_EXIT_NOTICE"), self.exit_notice_value().into())
     }
 
     pub fn state_dir(&self) -> &Path {
@@ -853,6 +876,25 @@ pub mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notice_permission_is_explicit_and_survives_supervisor_configuration() {
+        assert_eq!(resolve_exit_notice(None, "").unwrap(), None);
+        assert_eq!(resolve_exit_notice(None, "1").unwrap(), Some(true));
+        assert_eq!(resolve_exit_notice(Some("0"), "1").unwrap(), Some(false));
+        assert_eq!(resolve_exit_notice(Some("auto"), "1").unwrap(), None);
+        assert_eq!(resolve_exit_notice(Some(""), "1").unwrap(), None);
+        assert!(resolve_exit_notice(Some("yes"), "0").is_err());
+        assert!(resolve_exit_notice(None, "bad-stored-value").is_err());
+        let mut ctx = tests_support::ctx();
+        for (setting, value) in [(None, "auto"), (Some(false), "0"), (Some(true), "1")] {
+            ctx.exit_notice = setting;
+            let (_, persisted) = ctx.exit_notice_env("");
+            assert_eq!(resolve_exit_notice(None, &persisted).unwrap(), setting);
+            assert_eq!(ctx.exit_notice_env("TEST_RUNNER_"),
+                ("TEST_RUNNER_IPU_RUNNER_EXIT_NOTICE".into(), value.into()));
+        }
+    }
 
     #[test]
     fn named_recovery_uses_only_its_own_secure_record_and_preserves_overrides() {
