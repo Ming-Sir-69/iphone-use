@@ -55,6 +55,10 @@ https://github.com/user-attachments/assets/6192e8a6-ab2d-4dfc-b2e9-2c971f527d55
 
 普通问题和功能建议仍可在 GitHub 提交。咨询时请勿附上密码、验证码或私人账号数据。
 
+MCP 调用可用 `instance:"i13"` 选择已安装的本机实例，读屏和输入均支持；
+`phone_instances` 只读列出实例，不重连。省略参数仍使用启动时配置的 daemon，
+实例缺失时直接报错，不改选其他手机。见[按调用选择实例](crates/mcp/README.md#selecting-an-installed-instance-per-call)。
+
 ## 为什么用 iphone-use
 
 - **任何 App 都能操作，不需要 API。** 健康、银行、支付（包括禁止截屏的）、微信这类聊天 App，以及你自己在测的 App。

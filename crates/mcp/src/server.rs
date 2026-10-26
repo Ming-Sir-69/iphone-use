@@ -1,7 +1,7 @@
 //! MCP `ServerHandler` implementation — `PhoneHandler`.
 //!
 //! Each MCP tool maps onto a deliberately supported subset of the daemon's
-//! agent API. Device-target changes and destructive maintenance stay outside
+//! agent API. Calls may select an installed daemon instance; target configuration and destructive maintenance stay outside
 //! this surface.
 //!
 //! Pattern:
@@ -640,6 +640,7 @@ pub struct PhoneHandler {
     /// Which tools are listed and callable (`IPHONE_USE_MCP_TOOLS`), read
     /// once at start.
     profile: std::sync::Arc<ToolProfile>,
+    instances: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, PhoneHandler>>>,
 }
 
 /// Parameters for [`PhoneHandler::phone_login`].
@@ -860,6 +861,7 @@ impl PhoneHandler {
             last_flow_failure: std::sync::Arc::new(std::sync::Mutex::new(None)),
             progress: std::sync::Arc::default(),
             profile,
+            instances: std::sync::Arc::default(),
         }
     }
 
@@ -868,6 +870,17 @@ impl PhoneHandler {
     fn with_profile(mut self, profile: ToolProfile) -> Self {
         self.profile = std::sync::Arc::new(profile);
         self
+    }
+
+    fn for_instance(&self, name: &str) -> anyhow::Result<Self> {
+        let daemon = crate::instances::client(name, self.daemon.owner())?;
+        let mut instances = self.instances.lock().map_err(|_| anyhow::anyhow!("instance routing unavailable"))?;
+        if let Some(handler) = instances.get(name).filter(|handler| handler.daemon.same_target(&daemon)) {
+            return Ok(handler.clone());
+        }
+        let handler = Self::with_shared_profile(daemon, self.profile.clone());
+        instances.insert(name.to_string(), handler.clone());
+        Ok(handler)
     }
 
     /// Start tracking an observed action: the screen and the action's key are
@@ -926,6 +939,45 @@ impl PhoneHandler {
 // `PhoneHandler::tool_router()` fn used by `#[tool_handler]` below.
 #[tool_router]
 impl PhoneHandler {
+    #[tool(
+        annotations(read_only_hint = true, open_world_hint = false),
+        description = "List installed local iPhone instances and their read-only status. Does not start, reconnect or claim a phone. Pass instance in any phone_* call to choose one; omitted instance preserves this MCP server's configured daemon. Missing/invalid instances never fall back to another phone."
+    )]
+    async fn phone_instances(&self) -> CallToolResult {
+        let names = match crate::instances::names() {
+            Ok(names) => names,
+            Err(_) => return CallToolResult::error(vec![Content::text("installed-instance discovery failed")]),
+        };
+        let mut rows = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        for name in names {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                rows.push(serde_json::json!({"instance":name,"available":false,"error":"status_not_checked_budget"}));
+                continue;
+            }
+            let handler = match self.for_instance(&name) {
+                Ok(handler) => handler,
+                Err(_) => {
+                    rows.push(serde_json::json!({"instance":name,"available":false,"error":"invalid_or_unavailable_configuration"}));
+                    continue;
+                }
+            };
+            let status = tokio::time::timeout(remaining.min(std::time::Duration::from_secs(2)), handler.daemon.status()).await;
+            rows.push(match status {
+                Ok(Ok(status)) => serde_json::json!({"instance":name,"available":true,
+                    "drivable":status.drivable,"released":status.released,"owner":status.owner,
+                    "device":status.extra.get("device"),"human_handoff":status.extra.get("human_handoff")}),
+                _ => serde_json::json!({"instance":name,"available":false,"error":"status_unavailable"}),
+            });
+        }
+        let body = serde_json::json!({"instances":rows,"selection":"per_call","implicit_target":"configured_daemon"});
+        let mut result = CallToolResult::success(vec![Content::text(body.to_string())]);
+        result.structured_content = Some(body);
+        result
+    }
+
+
     // -----------------------------------------------------------------------
     // phone_capabilities
     // -----------------------------------------------------------------------
@@ -2674,6 +2726,15 @@ fn listed_tools(profile: &ToolProfile) -> Vec<rmcp::model::Tool> {
                 tool.input_schema = std::sync::Arc::new(schema);
                 tool.description = Some("Read the current app's applied-action trail as a flow v1 draft and todo list; never executes the flow. Typed values are replaced with named inputs. In this read-only profile no file is written and save_as is unavailable. Inspect and fix the draft before using phone_flow_run in an action-enabled session.".into());
             }
+            if tool.name != "phone_instances" {
+                let mut schema = (*tool.input_schema).clone();
+                let properties = schema.entry("properties").or_insert_with(|| serde_json::json!({}));
+                if let Some(properties) = properties.as_object_mut() {
+                    properties.insert("instance".into(), serde_json::json!({"type":"string",
+                        "description":"Installed local instance name, such as i13 or default. Omit to use the configured daemon. No fallback on failure."}));
+                }
+                tool.input_schema = std::sync::Arc::new(schema);
+            }
             tool
         })
         .collect();
@@ -2904,10 +2965,19 @@ fn keep_codex_images(mut result: CallToolResult, codex_client: bool) -> CallTool
 impl ServerHandler for PhoneHandler {
     async fn call_tool(
         &self,
-        request: rmcp::model::CallToolRequestParams,
+        mut request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let instance = request.arguments.as_mut().and_then(|args| args.remove("instance"));
+        let instance = match instance {
+            Some(serde_json::Value::String(name)) if crate::instances::valid_name(&name) => Some(name),
+            Some(_) => return Err(rmcp::ErrorData::invalid_params("instance must be a valid installed-instance name", None)),
+            None => None,
+        };
         let name = request.name.clone();
+        if name == "phone_instances" && instance.is_some() {
+            return Err(rmcp::ErrorData::invalid_params("phone_instances lists all installed instances and takes no instance argument", None));
+        }
         if let Some(refusal) = self.profile.refusal(&name) {
             return Ok(refusal);
         }
@@ -2915,8 +2985,23 @@ impl ServerHandler for PhoneHandler {
             .peer
             .peer_info()
             .is_some_and(|info| is_codex_client(&info.client_info.name));
-        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let result = Self::tool_router().call(tcc).await?;
+        let selected = match instance.as_deref() {
+            Some(name) => Some(self.for_instance(name).map_err(|_| rmcp::ErrorData::invalid_params(
+                "installed instance unavailable or unsafe; no action sent and no other phone selected", None))?),
+            None => None,
+        };
+        let handler = selected.as_ref().unwrap_or(self);
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(handler, request, context);
+        let mut result = Self::tool_router().call(tcc).await?;
+        result.meta.get_or_insert_with(rmcp::model::Meta::new).0
+            .insert("iphone-use/instance".into(), serde_json::json!(instance));
+        if let Some(instance) = &instance {
+            result.content.insert(0, Content::text(format!("instance: {instance}")));
+            if name == "phone_status" || name == "phone_screen" {
+                result.meta.as_mut().unwrap().0.insert("openai/widgetSessionId".into(),
+                    serde_json::json!(format!("iphone-use-screen-{instance}")));
+            }
+        }
         Ok(keep_codex_images(
             finish_result(&name, result, StructuredMode::from_env()),
             codex_client,
@@ -2973,7 +3058,10 @@ impl ServerHandler for PhoneHandler {
             ))
             .with_instructions(
                 "Drive a real iPhone. The loop:\n\
-                 1. phone_status — act only when drivable=true. If not, report its `hint` and stop; \
+                 1. If the user names a phone or there are multiple installed phones, use phone_instances \
+                 and pass the chosen instance on every phone_* call. Omitted instance describes only the configured daemon, \
+                 never all phones. Explicit unavailable instances fail without fallback. \
+                 phone_status — act only when drivable=true. If not, report its `hint` and stop; \
                  call phone_reconnect once only when the user's current task needs the phone \
                  (each reconnect may make the user type the passcode), never for health checks.\n\
                  2. Look for a saved flow FIRST. Responses that enter an app (launch_app, the first \
@@ -4356,7 +4444,7 @@ mod tests {
 
         assert_eq!(
             names.len(),
-            38,
+            39,
             "tool count changed; update README, the skill, and the CI assertion: {names:?}"
         );
         for required in [
@@ -4438,7 +4526,7 @@ mod tests {
 
     /// The tools that only read: no phone input, no outward-facing writes.
     /// `IPHONE_USE_MCP_TOOLS=readonly` exposes exactly these.
-    const READ_ONLY_TOOLS: [&str; 12] = [
+    const READ_ONLY_TOOLS: [&str; 13] = [
         "phone_apps",
         "phone_capabilities",
         "phone_crashes",
@@ -4447,6 +4535,7 @@ mod tests {
         "phone_flow_info",
         "phone_flow_list",
         "phone_home_layout",
+        "phone_instances",
         "phone_screen",
         "phone_screen_frame",
         "phone_screenshot",
@@ -5171,7 +5260,7 @@ mod tests {
                 assert!(tool.get("_meta").is_none(), "{name} has no _meta: {tool}");
             }
         }
-        assert_eq!(tools.len(), 38, "the whole documented surface");
+        assert_eq!(tools.len(), 39, "the whole documented surface");
     }
 
     #[test]

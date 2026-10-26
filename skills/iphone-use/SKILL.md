@@ -25,7 +25,10 @@ curl -s -H "$AUTH" "$HOST/agent/status"             # probe first; on failure st
 
 ## The loop
 
-1. **Probe.** `GET /agent/status` / `phone_status`. Screen reads and UI input
+1. **Probe.** If the user names a phone or multiple phones are installed, first
+   use `phone_instances`, then pass that `instance` on every MCP read/action.
+   Omitted instance reports only the configured daemon, never all phones.
+   `GET /agent/status` / `phone_status`. Screen reads and UI input
    require `drivable:true`; otherwise report `hint` and stop those operations.
    Paired metadata reads (`phone_home_layout`, `phone_apps`) and cached capability
    discovery do not require a running Runner. Use them without reconnecting or
@@ -246,3 +249,14 @@ Jev retries only one observation on HTTP 504 `runner_source_timeout`, after
 the server's 1–60 second `retry_after_secs`. It never replays the preceding
 action. If post-action observation recovery fails, inspect `status:"blocked"`,
 `history`, and `last_successful_action`, then read before acting again.
+
+## Multiple installed phones
+
+Use `phone_instances` for a read-only local instance inventory. Pass `instance`
+(e.g. `i13`, `default`) on each other `phone_*` call to address that daemon.
+Keep it consistent across reads and actions; omitted instance preserves the
+MCP server's startup configuration. No target is changed and no unavailable
+instance falls back to another phone. Do not read tokens or hand-write HTTP just
+to switch instances. Discovery never reconnects; ordinary ownership, privacy,
+lock and phone-ended/human-handoff rules still apply. Runtime selection supports
+installed local LaunchAgents; simulator-only records remain separate.

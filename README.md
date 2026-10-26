@@ -55,6 +55,11 @@ Want to support ongoing maintenance? Email us to discuss a one-time or recurring
 
 Community bug reports and feature requests remain welcome on GitHub. Please keep credentials and private account data out of inquiries.
 
+MCP calls can choose an installed local instance with `instance:"i13"` (including
+`phone_status` and input tools); `phone_instances` lists them without reconnecting.
+Omit it to keep the configured daemon. Missing instances fail without selecting a
+different phone. See [per-call instance routing](crates/mcp/README.md#selecting-an-installed-instance-per-call).
+
 ## Why iphone-use
 
 - **Any app, no API needed.** It works on Health, banking and payment apps (even the ones that black out screen capture), chat apps and your own app under test.
