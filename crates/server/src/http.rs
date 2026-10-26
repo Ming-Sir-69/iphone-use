@@ -3834,6 +3834,10 @@ fn classify_build_state(phase: &str, age_secs: u64) -> &'static str {
     if phase == "parked" {
         return "parked";
     }
+    // A deliberately stopped helper is terminal, even after its status ages.
+    if phase == "stopped" {
+        return "stopped";
+    }
     if phase.ends_with("-fail") {
         return "failed";
     }
@@ -23238,6 +23242,7 @@ mod tests {
     fn build_state_parked_is_terminal_and_does_not_claim_work_or_failure() {
         for age in [0, 10, BUILD_STALE_SECS + 1, 99_999] {
             assert_eq!(classify_build_state("parked", age), "parked");
+            assert_eq!(classify_build_state("stopped", age), "stopped");
         }
     }
 
