@@ -32,7 +32,10 @@ class Daemon(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers.get('Content-Length', '0')))
         with seen_lock:
             seen.append((self.server.name, self.command, self.path, self.headers.get('Authorization'), body))
-        if self.path.startswith('/agent/elements'):
+        if self.path.startswith('/agent/capabilities'):
+            value = {'ok': True, 'operations': {'single': ['tap', 'type'],
+                'batch': {'max': 24}}, 'limits': {'nested': {'value': 'x' * 300}}}
+        elif self.path.startswith('/agent/elements'):
             value = {'ok': True, 'snapshot': self.server.name, 'elements': []}
         elif self.command == 'POST':
             value = {'ok': True, 'snapshot': self.server.name + '2', 'elements': []}
@@ -121,6 +124,10 @@ try:
                 assert result['_meta']['openai/widgetSessionId'].endswith(instance)
                 assert seen[-1][0] == marker and seen[-1][3] == 'Bearer ' + token
                 assert 'result' in call('phone_elements', instance=instance)
+            capabilities = call('phone_capabilities', instance='i13')['result']
+            assert capabilities['structuredContent'] == {'ok': True,
+                'operations': {'single': ['tap', 'type'], 'batch': {'max': 24}},
+                'limits': {'nested': {'value': 'x' * 300}}}, 'named capabilities must preserve the full nested contract'
             # Interleaved reads must keep separate observation baselines.
             for instance, marker in [('i13', 'B'), ('default', 'A')]:
                 response = call('phone_tap', instance=instance, x=0.5, y=0.5, observe=True)

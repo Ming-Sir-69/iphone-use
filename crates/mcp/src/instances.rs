@@ -60,9 +60,13 @@ pub(crate) fn client(name: &str, owner: &str) -> Result<DaemonClient> {
 
 pub(crate) fn names_at(home: &Path) -> Result<Vec<String>> {
     let dir = home.join("Library/LaunchAgents");
-    if !dir.exists() { return Ok(Vec::new()); }
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
     let mut names = Vec::new();
-    for entry in std::fs::read_dir(dir)? {
+    for entry in entries {
         let entry = entry?;
         let file = entry.file_name();
         let Some(file) = file.to_str().and_then(|s| s.strip_suffix(".plist")) else { continue; };
@@ -108,6 +112,15 @@ mod tests {
             assert!(parse_target("i13", &invalid).is_err());
         }
     }
+    #[test]
+    fn discovery_does_not_turn_path_errors_into_an_empty_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(names_at(dir.path()).unwrap().is_empty());
+        std::fs::create_dir(dir.path().join("Library")).unwrap();
+        symlink("LaunchAgents", dir.path().join("Library/LaunchAgents")).unwrap();
+        assert!(names_at(dir.path()).is_err(), "a symlink loop must remain a discovery error");
+    }
+
     #[test]
     fn discovery_ignores_supervisors_and_private_reader_rejects_unsafe_paths() {
         let dir = tempfile::tempdir().unwrap();

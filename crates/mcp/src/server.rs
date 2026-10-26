@@ -2996,16 +2996,19 @@ impl ServerHandler for PhoneHandler {
         result.meta.get_or_insert_with(rmcp::model::Meta::new).0
             .insert("iphone-use/instance".into(), serde_json::json!(instance));
         if let Some(instance) = &instance {
-            result.content.insert(0, Content::text(format!("instance: {instance}")));
             if name == "phone_status" || name == "phone_screen" {
                 result.meta.as_mut().unwrap().0.insert("openai/widgetSessionId".into(),
                     serde_json::json!(format!("iphone-use-screen-{instance}")));
             }
         }
-        Ok(keep_codex_images(
+        let mut result = keep_codex_images(
             finish_result(&name, result, StructuredMode::from_env()),
             codex_client,
-        ))
+        );
+        if let Some(instance) = &instance {
+            result.content.insert(0, Content::text(format!("instance: {instance}")));
+        }
+        Ok(result)
     }
 
     async fn list_tools(
