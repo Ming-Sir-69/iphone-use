@@ -3274,7 +3274,11 @@ impl Setup {
         // runner lives on, refused), or the runner process ended with the
         // phone here and unlocked. Leave the phone to them; the next request
         // brings the runner back.
-        if cause == "revoked" || cause == "runner" {
+        if runner_end_parks(
+            cause,
+            cause == "runner" && runner::log_shows_automation_revoked(&self.ctx.run_log, log_mark),
+            cause == "runner" && runner::log_shows_connection_invalidated(&self.ctx.run_log),
+        ) {
             return self.park_on_phone(crate::phone_exit::Reason::Exited);
         }
         match cause {
@@ -3339,6 +3343,14 @@ impl Setup {
         );
         Err(Exit(1))
     }
+}
+
+/// Whether a runner end is the person's (park) rather than the link's
+/// (rebuild). A runner that exited after its session link was invalidated is
+/// rebuilt, unless this run's log also shows the volume-key revocation, which
+/// always wins.
+fn runner_end_parks(cause: &str, revoked: bool, invalidated: bool) -> bool {
+    cause == "revoked" || (cause == "runner" && (revoked || !invalidated))
 }
 
 /// `/status` within 4 s: `None` when it did not answer below 400, else how
@@ -3869,6 +3881,15 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn only_an_invalidated_link_turns_a_runner_end_into_a_rebuild() {
+        assert!(runner_end_parks("revoked", false, false));
+        assert!(runner_end_parks("runner", false, false), "a plain runner end parks");
+        assert!(runner_end_parks("runner", true, true), "this run's revocation wins");
+        assert!(!runner_end_parks("runner", false, true));
+        assert!(!runner_end_parks("unreachable", false, true));
+    }
 
     #[test]
     fn already_started_supervisor_is_not_bootstrapped_again() {
