@@ -3773,7 +3773,7 @@ fn parse_setup_status(txt: &str, now: u64) -> Option<RunnerSetupStatus> {
 /// "go look".
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunnerBuild {
-    /// `ready` | `building` | `failed` | `stalled` | `unknown`.
+    /// `ready` | `building` | `failed` | `stalled` | `parked` | `stopped` | `unknown`.
     state: &'static str,
     /// The helper's own phase string, verbatim (`building`, `ddi-wait`, …).
     phase: String,
