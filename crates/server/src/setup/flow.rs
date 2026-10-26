@@ -516,6 +516,9 @@ impl Setup {
             crate::phone_exit::Reason::Exited => {
                 "the device runner was ended on the iPhone; it stays off until the next agent or web request"
             }
+            crate::phone_exit::Reason::SessionInvalidated => {
+                "the XCTest connection was invalidated; operator intent is unknown, so the runner stays off until an explicit agent or web request"
+            }
             crate::phone_exit::Reason::PasscodeCanceled => {
                 "the passcode prompt was cancelled on the iPhone; the phone stays with its holder until someone takes it back (web 「交给 agent」 or iphone-use resume)"
             }
@@ -3243,6 +3246,12 @@ impl Setup {
             }
             proc::sleep(Duration::from_secs(10))?;
         };
+        // hold observed revocation without a confirmed lock. A failed lock
+        // probe is inconclusive; a later disconnect must not erase the
+        // conservative park and permit automatic reconnect.
+        if cause == "revoked" {
+            return self.park_on_phone(crate::phone_exit::Reason::Exited);
+        }
         // An unplugged phone takes its runner down with it. Nothing can be
         // rebuilt until it is back, so say so and wait instead.
         let absent = if self.legacy_ios.is_some() {
@@ -3274,8 +3283,12 @@ impl Setup {
         // runner lives on, refused), or the runner process ended with the
         // phone here and unlocked. Leave the phone to them; the next request
         // brings the runner back.
-        if cause == "revoked" || cause == "runner" {
-            return self.park_on_phone(crate::phone_exit::Reason::Exited);
+        if let Some(reason) = runner_end_reason(
+            cause,
+            runner::log_shows_automation_revoked(&self.ctx.run_log, log_mark),
+            runner::log_shows_connection_invalidated(&self.ctx.run_log, log_mark),
+        ) {
+            return self.park_on_phone(reason);
         }
         match cause {
             "unreachable" => {
@@ -3338,6 +3351,18 @@ impl Setup {
             Role::Runner,
         );
         Err(Exit(1))
+    }
+}
+
+/// An invalidated connection does not prove operator intent. Both outcomes
+/// park; only their reported evidence differs. Explicit revocation wins.
+fn runner_end_reason(cause: &str, revoked: bool, invalidated: bool) -> Option<crate::phone_exit::Reason> {
+    use crate::phone_exit::Reason;
+    match cause {
+        "revoked" => Some(Reason::Exited),
+        "runner" if revoked || !invalidated => Some(Reason::Exited),
+        "runner" => Some(Reason::SessionInvalidated),
+        _ => None,
     }
 }
 
@@ -3869,6 +3894,16 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn session_end_evidence_never_enables_automatic_rebuild() {
+        use crate::phone_exit::Reason;
+        assert_eq!(runner_end_reason("revoked", false, true), Some(Reason::Exited));
+        assert_eq!(runner_end_reason("runner", true, true), Some(Reason::Exited));
+        assert_eq!(runner_end_reason("runner", false, false), Some(Reason::Exited));
+        assert_eq!(runner_end_reason("runner", false, true), Some(Reason::SessionInvalidated));
+        assert_eq!(runner_end_reason("unreachable", false, true), None);
+    }
 
     #[test]
     fn already_started_supervisor_is_not_bootstrapped_again() {

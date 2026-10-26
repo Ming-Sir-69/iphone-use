@@ -2685,6 +2685,10 @@ async fn agent_status(
     let human_handoff = released && human_handoff_active();
     let ended_on_phone =
         ended_on_phone(released, human_handoff, &crate::instance::current().state_dir);
+    let runner_parked = crate::phone_exit::parked(&crate::instance::current().state_dir);
+    let runner_parked_reason_json = serde_json::to_string(
+        &crate::phone_exit::reason(&crate::instance::current().state_dir).map(|reason| reason.as_str())
+    ).unwrap_or_else(|_| "null".into());
     // L2 health — action-level, not just /status (which lies: it reports
     // `ready` even when every UI action fails Code=41 because the phone is
     // locked or the test session was severed). `runner` stays "runner reachable"
@@ -2851,6 +2855,8 @@ async fn agent_status(
             ("handoff", "the phone was handed to a person (mode=human) and the device runner is stopped so they can use it in hand — POST /agent/mode {mode:agent} takes it back")
         } else if ended_on_phone {
             ("ended_on_phone", "the session was ended on the iPhone (both volume keys) and nothing restarts the device runner on its own — ask the person before taking it back; the next action or reconnect starts it again")
+        } else if released && runner_parked {
+            ("session_parked", "the XCTest session ended with uncertain intent; the runner stays parked until a new explicit agent or web request")
         } else if released {
             ("released", "direct device service was released after inactivity — reconnect to restart the device runner, then keep the phone unlocked and awake")
         } else if !state.managed_runner {
@@ -2999,7 +3005,7 @@ async fn agent_status(
     // The daemon inside the runner on the phone, as its last /status said.
     let phone_daemon = crate::phone_daemon::status_json(runner);
     let body = format!(
-        r#"{{"ok":true,"backend":"direct",{target_field}"instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_runner":{},"managed_runner_pending":{},"recovery_owner":"{recovery_owner}","runner":{runner},"runner_actionable":{runner_actionable},"runner_locked":{runner_locked},"drivable":{drivable},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","releasing":{releasing},"reconnecting":{reconnecting},"warming":{warming},"released":{released},"human_handoff":{human_handoff},"ended_on_phone":{ended_on_phone},"hold_remaining_secs":{hold_remaining},"screen_private_secs":{screen_private_secs},"idle_secs":{idle_secs},"hint":{hint_json},"next_step":{next_step_json},"setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"runner_build":{runner_build},"runner_died_reason":"{runner_died_reason}","runner_died_at":{runner_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"capture_redacted":{capture_redacted},"version":"{version}","latest":{latest_json},"update_available":{update_available},"auto_update":{auto_update},"transport":"{transport}","runner_rtt_ms":{rtt_json},"transport_hint":{transport_hint},"wifi_start_refused":{wifi_start_refused},"keep_runner_alive":{keep_runner_alive},"legacy_ios":{legacy_ios},"lock_readiness":{lock_readiness},"device":{device},"agent_focus":{agent_focus},"phone_daemon":{phone_daemon}}}"#,
+        r#"{{"ok":true,"backend":"direct",{target_field}"instance":"{}","udid":{},"owner":{},"owner_lease_remaining_secs":{},"target_configured":{},"managed_runner":{},"managed_runner_pending":{},"recovery_owner":"{recovery_owner}","runner":{runner},"runner_actionable":{runner_actionable},"runner_locked":{runner_locked},"drivable":{drivable},"mode":"{mode}","device_state":"{device_state}","screen_state":"{screen_state}","releasing":{releasing},"reconnecting":{reconnecting},"warming":{warming},"released":{released},"human_handoff":{human_handoff},"ended_on_phone":{ended_on_phone},"runner_parked":{runner_parked},"runner_parked_reason":{runner_parked_reason_json},"hold_remaining_secs":{hold_remaining},"screen_private_secs":{screen_private_secs},"idle_secs":{idle_secs},"hint":{hint_json},"next_step":{next_step_json},"setup_blocked_on":"{setup_blocked_on}","setup_phase":{setup_phase_json},"setup_message":{setup_message_json},"runner_build":{runner_build},"runner_died_reason":"{runner_died_reason}","runner_died_at":{runner_died_at},"viewer_count":{viewer_count},"mjpeg_viewer_count":{mjpeg_viewer_count},"mjpeg_stream_fresh":{mjpeg_stream_fresh},"mjpeg_stream_age_ms":{mjpeg_stream_age_json},"capture_redacted":{capture_redacted},"version":"{version}","latest":{latest_json},"update_available":{update_available},"auto_update":{auto_update},"transport":"{transport}","runner_rtt_ms":{rtt_json},"transport_hint":{transport_hint},"wifi_start_refused":{wifi_start_refused},"keep_runner_alive":{keep_runner_alive},"legacy_ios":{legacy_ios},"lock_readiness":{lock_readiness},"device":{device},"agent_focus":{agent_focus},"phone_daemon":{phone_daemon}}}"#,
         crate::instance::current().name,
         serde_json::to_string(&status_udid).unwrap_or_else(|_| "null".into()),
         {
@@ -3535,6 +3541,10 @@ fn human_next_step(
         "ended_on_phone" => (
             "已在手机上退出，这台 Mac 不会自动重连；需要远程操作时点「连接手机」",
             "Ended on the phone; this Mac will not reconnect on its own — choose Connect to control it again",
+        ),
+        "session_parked" => (
+            "测试会话已结束，控制保持停驻；需要远程操作时点「连接手机」",
+            "The test session ended and remains parked; choose Connect when remote control is needed",
         ),
         "released" => (
             "一段时间没人操作，连接已暂停；点「连接手机」继续（手机需解锁亮屏）",
@@ -5258,7 +5268,7 @@ fn persist_human_handoff(active: bool) -> std::io::Result<()> {
 /// Status `ended_on_phone`: released after an end on the phone, and not
 /// handed over (a hand-off says more).
 fn ended_on_phone(released: bool, human_handoff: bool, state_dir: &std::path::Path) -> bool {
-    released && !human_handoff && crate::phone_exit::parked(state_dir)
+    released && !human_handoff && crate::phone_exit::reason(state_dir) == Some(crate::phone_exit::Reason::Exited)
 }
 
 /// Follow the phone's end-of-session markers (see [`crate::phone_exit`]):
@@ -22937,6 +22947,17 @@ mod tests {
         assert!(ended_on_phone(true, false, dir.path()));
         assert!(!ended_on_phone(false, false, dir.path()), "not released yet");
         assert!(!ended_on_phone(true, true, dir.path()), "the hand-off says more");
+    }
+
+    #[test]
+    fn invalidated_or_unknown_parking_does_not_claim_a_phone_side_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::phone_exit::park(dir.path(), crate::phone_exit::Reason::SessionInvalidated).unwrap();
+        assert!(crate::phone_exit::parked(dir.path()));
+        assert!(!ended_on_phone(true, false, dir.path()));
+        std::fs::write(dir.path().join(crate::phone_exit::PARKED_FILE), "unknown").unwrap();
+        assert!(crate::phone_exit::parked(dir.path()));
+        assert!(!ended_on_phone(true, false, dir.path()));
     }
 
     #[test]

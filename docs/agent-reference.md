@@ -43,6 +43,7 @@ passcode.
 | `degraded` | runner answers but the last read/action did not complete (heavy page, stalled app) | **Not** a blocker; `setup_blocked_on` is empty. Wait `retry_after_secs` (3s) and read again; do not restart anything. |
 | `released` + `human_handoff:true` | The operator handed the phone to a person | Input answers `409 phone_handed_to_human`. Ask the operator before sending `{"mode":"agent"}`. Also set by `iphone-use pause` and by a passcode prompt cancelled on the phone; it survives daemon restarts. `iphone-use resume` clears it. |
 | `released` + `ended_on_phone:true` | The person ended the session on the phone (both volume keys) | Nothing restarts the runner on its own and pre-warm skips it. Ask before acting; the next action or `{"mode":"agent"}` starts it again. |
+| `released` + `runner_parked:true` + `ended_on_phone:false` | The test connection was invalidated or the parked evidence is unknown | Automatic schedules and prewarming stay off. A new explicit request may reconnect. `runner_parked_reason` describes the recorded evidence; it does not assert a human exit or a Wi-Fi cause. |
 
 **Lock readiness.** `lock_readiness` says whether the phone will lock on its
 own while nobody drives it, so an owner with many phones sees which ones get
@@ -1297,7 +1298,7 @@ resolve live UI elements before sending a gesture. An unavailable service return
 `503 home_layout_unavailable`, never a successful empty layout. Simulator targets
 are explicitly unsupported. No endpoint changes the saved layout.
 
-When `ended_on_phone=true`, automatic schedules remain postponed. An explicitly
+When `runner_parked=true` (or legacy `ended_on_phone=true`), automatic schedules remain postponed. An explicitly
 requested manual schedule run may reconnect, but it still respects human handoff,
 other owners, live viewers and lock state. A parked helper reports
 `runner_build.state="parked"`, including after five minutes; it is neither

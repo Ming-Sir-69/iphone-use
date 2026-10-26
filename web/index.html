@@ -2178,12 +2178,14 @@ function showOverlay(kind) {
   } else if (kind === 'released') {
     const handedOver = backendStatus?.human_handoff === true;
     const endedOnPhone = backendStatus?.ended_on_phone === true;
-    setTextIfChanged(olTitle, handedOver ? t('手机已交还') : (endedOnPhone ? t('已在手机上退出') : t('设备空闲中')));
+    const sessionParked = backendStatus?.runner_parked === true && !endedOnPhone;
+    setTextIfChanged(olTitle, handedOver ? t('手机已交还') : (endedOnPhone ? t('已在手机上退出') : (sessionParked ? t('设备控制暂不可用') : t('设备空闲中'))));
     setTextIfChanged(olSub, handedOver
       ? t('手机在持有人手里，远程控制已停止。需要远程操作时点「连接手机」')
       : (endedOnPhone
         ? t('这台 Mac 不会自动重连。需要远程操作时点「连接手机」')
-        : t('一段时间没人操作，设备连接已暂停。点「连接手机」继续（手机需解锁亮屏）')));
+        : (sessionParked ? directHintText(backendStatus, t('请检查服务是否正在运行，然后重试'))
+          : t('一段时间没人操作，设备连接已暂停。点「连接手机」继续（手机需解锁亮屏）'))));
     offlineOverlay.classList.add('disconnected');
   } else if (kind === 'releasing') {
     setTextIfChanged(olTitle, t('正在释放设备'));

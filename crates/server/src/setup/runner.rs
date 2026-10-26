@@ -226,21 +226,18 @@ pub fn log_shows_passcode_canceled(path: &Path) -> bool {
 /// for performing UI testing actions.`). Only the log after byte `from` is
 /// read, so lines from before the runner was ready do not count.
 pub fn log_shows_automation_revoked(path: &Path, from: u64) -> bool {
+    read_log_since(path, from).contains("Not authorized for performing UI testing actions")
+}
+
+fn read_log_since(path: &Path, from: u64) -> String {
     use std::io::{Read as _, Seek as _};
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
+    let Ok(mut file) = std::fs::File::open(path) else { return String::new(); };
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    // A capped (shorter) log starts over from its kept tail.
     let from = if from > len { 0 } else { from };
-    if file.seek(std::io::SeekFrom::Start(from)).is_err() {
-        return false;
-    }
+    if file.seek(std::io::SeekFrom::Start(from)).is_err() { return String::new(); }
     let mut tail = Vec::new();
-    if file.read_to_end(&mut tail).is_err() {
-        return false;
-    }
-    String::from_utf8_lossy(&tail).contains("Not authorized for performing UI testing actions")
+    if file.read_to_end(&mut tail).is_err() { return String::new(); }
+    String::from_utf8_lossy(&tail).into_owned()
 }
 
 /// The log's current length, the `from` for [`log_shows_automation_revoked`].
@@ -283,6 +280,17 @@ pub fn log_shows_link_dropped(path: &Path) -> bool {
     let text = read_log(path);
     text.contains("Failed to establish communication with the test runner")
         || text.contains("A connection to this device could not be established")
+}
+
+/// The test session's link to the phone was invalidated under a live runner:
+/// `testServe() encountered an error (… communicating with a remote process.
+/// (Underlying Error: The connection was invalidated.))`. Seen on Wi-Fi tunnel
+/// drops and WARP/VPN reconnects; a recovery heuristic, not proof that nobody
+/// at the phone ended the session.
+pub fn log_shows_connection_invalidated(path: &Path, from: u64) -> bool {
+    any_line(&read_log_since(path, from), |line| {
+        ordered(line, "communicating with a remote process", "The connection was invalidated")
+    })
 }
 
 pub fn log_shows_untrusted(path: &Path) -> bool {
@@ -883,6 +891,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn connection_evidence_uses_the_same_current_log_window_as_revocation() {
+        let old = "communicating with a remote process: The connection was invalidated.\n";
+        let file = log(old);
+        let mark = old.len() as u64;
+        assert!(log_shows_connection_invalidated(file.path(), 0));
+        assert!(!log_shows_connection_invalidated(file.path(), mark));
+        std::fs::write(file.path(), format!("{old}Not authorized for performing UI testing actions\n")).unwrap();
+        assert!(log_shows_automation_revoked(file.path(), mark));
+        assert!(!log_shows_connection_invalidated(file.path(), mark));
+        std::fs::write(file.path(), old).unwrap();
+        assert!(log_shows_connection_invalidated(file.path(), mark + 100));
+    }
+
+    #[test]
     fn the_cache_key_carries_the_embed_library_hash() {
         let ctx = crate::setup::ctx::tests_support::ctx();
         let key = |embed: &str| cache_key(&ctx, "src", "b", "t", "u", "16", "18.0", "", embed);
@@ -1124,6 +1146,17 @@ mod tests {
             ),
             "a missing iOS platform is not an unreachable phone"
         );
+        // A Wi-Fi tunnel drop under a live runner (hardware, iOS 27.0.1): the
+        // runner ends, but not from the phone.
+        let severed = log("Testing failed:\n\tAn error occurred while communicating with a remote process.\n\ttestServe() encountered an error (Encountered a problem with the test runner after launch. (Underlying Error: An error occurred while communicating with a remote process. (Underlying Error: The connection was invalidated.)))\n");
+        assert!(log_shows_connection_invalidated(severed.path(), 0));
+        assert!(!log_shows_product_failure(severed.path()));
+        assert!(!log_shows_connection_invalidated(
+            log("Test Case '-[RunnerTests testServe]' failed (2.104 seconds).").path(), 0
+        ));
+        assert!(!log_shows_connection_invalidated(
+            log("Underlying Error: The connection was invalidated.").path(), 0
+        ));
         // What a runner that lost the race for port 8100 leaves behind: a
         // failed test, not a failed product (#265).
         let busy = log("2026-10-11 03:07:41.512+0900 IPhoneUseRunnerUITests-Runner[812:40211] ipu-runner: port 8100 on the phone is already in use \u{2014} another runner (or a previous one still exiting) holds it\n\
