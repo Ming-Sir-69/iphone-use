@@ -153,7 +153,8 @@ jobs:
           tools = listing["result"]["tools"]
           names = sorted(tool["name"] for tool in tools)
 
-          assert len(names) == 39, names
+          expected_names = json.load(open("scripts/fixtures/mcp-tools.json"))
+          assert sorted(names) == expected_names, names
           for required in (
               "phone_capabilities",
               "phone_home_layout",

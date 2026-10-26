@@ -108,7 +108,8 @@ try:
             process.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
             process.stdin.flush()
             tools = rpc('tools/list')['result']['tools']
-            assert len(tools) == 39
+            expected = json.loads((Path(__file__).resolve().parent / 'fixtures/mcp-tools.json').read_text())
+            assert sorted(t['name'] for t in tools) == expected
             assert all('instance' in t['inputSchema'].get('properties', {})
                        for t in tools if t['name'] != 'phone_instances')
             catalog = call('phone_instances')['result']['structuredContent']['instances']

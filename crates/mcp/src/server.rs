@@ -4445,11 +4445,9 @@ mod tests {
         let mut names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         names.sort_unstable();
 
-        assert_eq!(
-            names.len(),
-            39,
-            "tool count changed; update README, the skill, and the CI assertion: {names:?}"
-        );
+        let expected: Vec<String> = serde_json::from_str(include_str!("../../../scripts/fixtures/mcp-tools.json")).unwrap();
+        let expected_refs: Vec<&str> = expected.iter().map(String::as_str).collect();
+        assert_eq!(names, expected_refs, "tool contract changed; update the shared fixture, README and skill");
         for required in [
             "phone_apps",
             "phone_screen",
@@ -5263,7 +5261,8 @@ mod tests {
                 assert!(tool.get("_meta").is_none(), "{name} has no _meta: {tool}");
             }
         }
-        assert_eq!(tools.len(), 39, "the whole documented surface");
+        let expected: Vec<String> = serde_json::from_str(include_str!("../../../scripts/fixtures/mcp-tools.json")).unwrap();
+        assert_eq!(tools.len(), expected.len(), "the whole documented surface");
     }
 
     #[test]

@@ -217,7 +217,8 @@ jobs:
           listing = next(item for item in responses if item.get("id") == 2)
           tools = listing["result"]["tools"]
           names = [tool["name"] for tool in tools]
-          assert len(names) == 38, names
+          expected_names = json.load(open("scripts/fixtures/mcp-tools.json"))
+          assert sorted(names) == expected_names, names
           for required in (
               "phone_run_steps",
               "phone_hold",
@@ -225,6 +226,7 @@ jobs:
               "phone_status",
               "phone_capabilities",
               "phone_home_layout",
+              "phone_instances",
           ):
               assert required in names, names
           run_steps = next(
@@ -383,6 +385,12 @@ jobs:
       # The on-phone daemon (crates/ios-embed) as a static library for iOS
       # devices. It ships inside the runner sources as runner/embed/, where
       # setup links it into the runner (see runner/README.md).
+      - name: Verify bundled instance routing and panel binding
+        shell: bash
+        run: |
+          python3 scripts/test-mcp-instances.py iPhoneUse.app/Contents/MacOS/iphone-use-mcp
+          node scripts/test-mcp-instance-panel.cjs
+
       - name: Build the on-phone daemon library (aarch64-apple-ios)
         shell: bash
         run: |
