@@ -3246,8 +3246,9 @@ impl Setup {
             }
             proc::sleep(Duration::from_secs(10))?;
         };
-        // hold already confirmed the phone was unlocked when authorization
-        // was revoked. A later lock/disconnect must not erase that exit.
+        // hold observed revocation without a confirmed lock. A failed lock
+        // probe is inconclusive; a later disconnect must not erase the
+        // conservative park and permit automatic reconnect.
         if cause == "revoked" {
             return self.park_on_phone(crate::phone_exit::Reason::Exited);
         }
