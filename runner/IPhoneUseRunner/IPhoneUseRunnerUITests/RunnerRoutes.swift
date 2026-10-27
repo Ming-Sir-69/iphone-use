@@ -767,10 +767,12 @@ extension RunnerTests {
         }) { app in coordinate(app, point).tap() }
         used.append(response.headers["X-IPU-Gesture"] ?? "unknown")
       } else {
-        if let error = timed("Synthesize", { IPURBridge.synthesizeTouchPaths(paths, name: "ipu-w3c-actions") }) {
-          throw RunnerError.failed("actions synthesis outcome unknown: \(error); no coordinate fallback attempted")
-        }
-        used.append("synthesized")
+        let backend = try GestureDelivery.run("actions", synthesisAvailable: IPURBridge.eventSynthesisAvailable(), synthesized: {
+          timed("Synthesize", { IPURBridge.synthesizeTouchPaths(paths, name: "ipu-w3c-actions") })
+        }, fallback: {
+          throw RunnerError.invalidArgument("actions require event synthesis, which is unavailable; nothing was sent")
+        })
+        used.append(backend)
       }
     }
     if !keys.isEmpty {
