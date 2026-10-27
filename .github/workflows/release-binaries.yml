@@ -3,12 +3,18 @@ name: Release Binaries
 # Trigger on version tags (e.g. v0.2.0) pushed to the repo,
 # OR manually via the Actions UI (workflow_dispatch).
 # On a tag push  → full release: build + bundle + sign + upload to GitHub Release.
-# On manual run  → dry-run: build + bundle + upload zip as a workflow artifact only.
+# On manual run  → dry-run build, or recover Registry metadata for an existing release.
 on:
   push:
     tags:
       - 'v[0-9]*'
   workflow_dispatch:
+    inputs:
+      registry_release:
+        description: 'Existing published tag to register without rebuilding (for example v0.27.3)'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: write   # required to create/upload GitHub Release assets
@@ -16,6 +22,7 @@ permissions:
 jobs:
   build-macos:
     name: Build macOS binary & create release
+    if: inputs.registry_release == ''
     runs-on: macos-14
     # The `secrets` context is NOT available in step `if:` expressions (GitHub
     # rejects the workflow at parse time). Map the gate secrets into job-level
@@ -533,29 +540,57 @@ jobs:
   publish-mcp-registry:
     name: Publish to the MCP Registry
     needs: build-macos
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: macos-14
+    if: >-
+      always() &&
+      ((startsWith(github.ref, 'refs/tags/') && needs.build-macos.result == 'success') ||
+       (github.event_name == 'workflow_dispatch' && inputs.registry_release != ''))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     continue-on-error: true
     permissions:
       contents: read
       id-token: write
+    env:
+      REGISTRY_TAG: ${{ inputs.registry_release || github.ref_name }}
+      MCP_PUBLISHER_VERSION: v1.8.6
     steps:
-      - name: Checkout repository
+      - name: Checkout the released source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.registry_release || github.ref }}
           persist-credentials: false
 
-      - name: Check server.json matches the tag
+      - name: Validate the published release and server version
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          want="${GITHUB_REF_NAME#v}"
-          have="$(python3 -c 'import json; print(json.load(open("server.json"))["version"])')"
-          test "$have" = "$want" || { echo "server.json is $have, tag is $want" >&2; exit 1; }
+          [[ "$REGISTRY_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || exit 1
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$REGISTRY_TAG" > "$RUNNER_TEMP/registry-release.json"
+          python3 - "$RUNNER_TEMP/registry-release.json" <<'PY'
+          import json, os, sys
+          release=json.load(open(sys.argv[1]))
+          tag=os.environ['REGISTRY_TAG']
+          assert release['tag_name']==tag and not release['draft'] and release['published_at']
+          assets={asset['name'] for asset in release['assets']}
+          payloads=['iPhoneUse.app.zip','iphone-use-app.tar.gz','iphone-use-runner.tar.gz',
+                    'iphone-use-mcp-macos-universal.tar.gz','browser-use-bridge-macos-universal.tar.gz']
+          assert set(payloads+[name+'.sha256' for name in payloads]) <= assets
+          assert json.load(open('server.json'))['version']==tag[1:]
+          PY
+
+      - name: Install the pinned Linux publisher
+        run: |
+          set -euo pipefail
+          archive=mcp-publisher_linux_amd64.tar.gz
+          curl --fail --location --silent --show-error --output "$RUNNER_TEMP/$archive" \
+            "https://github.com/modelcontextprotocol/registry/releases/download/$MCP_PUBLISHER_VERSION/$archive"
+          echo "1fbe93fc0783c2394d8012c8d6e50a59e98cb2cc2d216264cc69f405d0e21340  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" mcp-publisher
 
       - name: Publish
         run: |
           set -euo pipefail
-          brew install mcp-publisher
-          mcp-publisher login github-oidc
-          mcp-publisher publish
-          mcp-publisher logout
+          trap '"$RUNNER_TEMP/mcp-publisher" logout || true' EXIT
+          "$RUNNER_TEMP/mcp-publisher" login github-oidc
+          "$RUNNER_TEMP/mcp-publisher" publish
