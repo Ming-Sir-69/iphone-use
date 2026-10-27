@@ -683,7 +683,8 @@ pub struct ReconnectParams {
     /// Wait up to this many seconds (1–300) for the outcome instead of
     /// returning at once: the call returns when the phone is drivable, a
     /// blocker appears (setup_blocked_on, e.g. the passcode), or the time is
-    /// up — with the compact final state. A runner rebuild after an upgrade
+    /// up — with the compact final state (a blocker other than the passcode
+    /// must hold for 20 s first). A runner rebuild after an upgrade
     /// takes 1–2 min, so 180 covers it. Omit to return immediately.
     #[serde(default)]
     pub wait_secs: Option<u64>,
@@ -725,6 +726,23 @@ fn reconnect_wait_outcome(status: &crate::types::StatusResponse) -> Option<&'sta
         return Some("blocked");
     }
     (status.drivable == Some(true) && status.reconnecting != Some(true)).then_some("drivable")
+}
+
+/// How long a blocker other than the passcode must persist, while the daemon
+/// is still reconnecting, before a waiting reconnect reports it. Early phases
+/// report transient ones: on a Wi-Fi phone `ddi-wait` says `usb` for a moment
+/// before the tunnel comes up and the runner build starts.
+const RECONNECT_BLOCKER_SETTLE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Whether a blocker seen for `held` should end the wait now.
+fn reconnect_blocker_final(
+    status: &crate::types::StatusResponse,
+    held: std::time::Duration,
+) -> bool {
+    let blocker = status.setup_blocked_on.as_deref().unwrap_or_default();
+    status.reconnecting != Some(true)
+        || blocker.starts_with("needs_passcode")
+        || held >= RECONNECT_BLOCKER_SETTLE
 }
 
 /// Parameters for [`PhoneHandler::phone_run_start`].
@@ -1819,6 +1837,7 @@ impl PhoneHandler {
         let deadline = started + std::time::Duration::from_secs(wait_secs);
         let mut last_status = None;
         let mut last_error: Option<String> = None;
+        let mut blocked_since: Option<(String, tokio::time::Instant)> = None;
         let outcome = loop {
             if tokio::time::Instant::now() >= deadline { break "timeout"; }
             let status = match tokio::time::timeout_at(deadline, self.daemon.status()).await {
@@ -1831,10 +1850,26 @@ impl PhoneHandler {
             match status {
                 Ok(status) => {
                     let done = reconnect_wait_outcome(&status);
+                    let finished = match done {
+                        Some("blocked") => {
+                            let blocker = status.setup_blocked_on.clone().unwrap_or_default();
+                            let since = match &blocked_since {
+                                Some((seen, at)) if *seen == blocker => *at,
+                                _ => tokio::time::Instant::now(),
+                            };
+                            blocked_since = Some((blocker, since));
+                            reconnect_blocker_final(&status, since.elapsed())
+                        }
+                        Some(_) => true,
+                        None => {
+                            blocked_since = None;
+                            false
+                        }
+                    };
                     last_status = Some(status);
                     last_error = None;
-                    if let Some(outcome) = done {
-                        break outcome;
+                    if finished {
+                        break done.unwrap_or("drivable");
                     }
                 }
                 Err(e) => last_error = Some(format!("{e:#}")),
@@ -5321,6 +5356,18 @@ mod tests {
         let blocked = status(serde_json::json!({"ok": true, "drivable": false,
             "reconnecting": true, "setup_blocked_on": "needs_passcode_on_phone"}));
         assert_eq!(reconnect_wait_outcome(&blocked), Some("blocked"));
+        // The passcode ends the wait at once; a transient early blocker only
+        // once it has held, or once the daemon stopped reconnecting.
+        let zero = std::time::Duration::ZERO;
+        assert!(reconnect_blocker_final(&blocked, zero));
+        let ddi = status(serde_json::json!({"ok": true, "drivable": false,
+            "reconnecting": true, "setup_blocked_on": "usb", "setup_phase": "ddi-wait"}));
+        assert_eq!(reconnect_wait_outcome(&ddi), Some("blocked"));
+        assert!(!reconnect_blocker_final(&ddi, zero));
+        assert!(reconnect_blocker_final(&ddi, RECONNECT_BLOCKER_SETTLE));
+        let gave_up = status(serde_json::json!({"ok": true, "drivable": false,
+            "reconnecting": false, "setup_blocked_on": "usb"}));
+        assert!(reconnect_blocker_final(&gave_up, zero));
         let brief = reconnect_brief(&blocked);
         assert_eq!(brief["setup_blocked_on"], "needs_passcode_on_phone");
         assert_eq!(brief["drivable"], false);
