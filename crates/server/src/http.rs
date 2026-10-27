@@ -12327,11 +12327,15 @@ async fn agent_actions_inner(
                         None,
                     );
                 }
-                step_results.push(serde_json::json!({
+                let mut receipt = serde_json::json!({
                     "index": index,
                     "kind": "action",
                     "ok": true
-                }));
+                });
+                if let Some((_, resolved)) = launch_resolutions.iter().find(|(step, _)| *step == index) {
+                    receipt["resolved"] = resolved.clone();
+                }
+                step_results.push(receipt);
             }
             AgentActionStep::Pause { ms } => {
                 if tokio::time::timeout_at(
@@ -12586,16 +12590,6 @@ async fn agent_actions_inner(
         let mut health = recover(state.runner_health.lock());
         health.up = true;
         health.actionable = true;
-    }
-    // A launch by name says which app it opened (a loose name may have
-    // matched "Idol Ludo Board" for "idol ludo").
-    for (step_index, resolved) in launch_resolutions {
-        if let Some(step) = step_results
-            .iter_mut()
-            .find(|step| step["index"].as_u64() == Some(step_index as u64))
-        {
-            step["resolved"] = resolved;
-        }
     }
     let mut result = serde_json::json!({
         "ok": true,

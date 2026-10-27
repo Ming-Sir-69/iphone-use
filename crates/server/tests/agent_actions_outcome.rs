@@ -1022,3 +1022,26 @@ fn an_observed_batch_diffs_against_the_owners_last_screen() {
         assert!(again.get("elements").is_none(), "{again}");
     });
 }
+
+/// A later wait failure must not erase which app the confirmed launch opened.
+#[test]
+fn a_named_launch_keeps_its_resolution_when_a_later_wait_fails() {
+    block(async {
+        let runner = mock_runner(|request, _| {
+            let body = if request.starts_with("POST /session ") { SESSION }
+                else if request.contains("/source?format=json") { BARE_TREE }
+                else { r#"{"value":null}"# };
+            Some((Duration::ZERO, body.to_string()))
+        });
+        let (_, body) = post_actions(Some(runner.url()), r#"{"observe":false,"steps":[
+            {"kind":"action","action":{"type":"launch_app","app":"设置"}},
+            {"kind":"wait_for","expect":{"present":[{"label":"not present"}]},"timeout_ms":200,"poll_ms":50}
+        ]}"#).await;
+        assert_eq!(body["error"], "expectation_timeout", "{body}");
+        assert_eq!(body["applied_actions"], 1, "{body}");
+        assert_eq!(body["retry_safe"], false, "{body}");
+        assert_eq!(body["steps"][0]["ok"], true, "{body}");
+        assert_eq!(body["steps"][0]["resolved"]["bundle_id"], "com.apple.Preferences", "{body}");
+        assert_eq!(body["steps"][0]["resolved"]["app"], "设置", "{body}");
+    });
+}
