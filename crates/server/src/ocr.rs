@@ -490,78 +490,89 @@ mod tests {
 
 #[cfg(test)]
 mod background_tests {
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
     use super::*;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
 
-    #[tokio::test]
-    async fn cancelled_caller_keeps_one_worker_without_queuing_retries_or_reusing_its_text() {
-        let lane = Arc::new(tokio::sync::Semaphore::new(1));
-        let started = Arc::new(tokio::sync::Notify::new());
-        let finish = Arc::new(tokio::sync::Notify::new());
-        let signal = started.clone();
-        let release = finish.clone();
-        let worker_lane = lane.clone();
-        let caller = tokio::spawn(async move {
-            bounded_background(&worker_lane, async move {
-                signal.notify_one();
-                release.notified().await;
-                Ok("old screenshot text")
-            })
-            .await
-        });
-        tokio::time::timeout(Duration::from_secs(2), started.notified())
-            .await
-            .unwrap();
-        caller.abort();
-        assert!(caller.await.unwrap_err().is_cancelled());
-        let extra = Arc::new(AtomicUsize::new(0));
-        for _ in 0..8 {
-            let hits = extra.clone();
-            let rejected = bounded_background(&lane, async move {
-                hits.fetch_add(1, Ordering::SeqCst);
-                Ok("unexpected screenshot text")
-            })
-            .await;
-            assert!(rejected
-                .unwrap_err()
-                .to_string()
-                .contains("already recognizing"));
-        }
-        assert_eq!(extra.load(Ordering::SeqCst), 0);
-        finish.notify_one();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while lane.available_permits() == 0 {
-                tokio::task::yield_now().await;
+    #[test]
+    fn cancelled_caller_keeps_one_worker_without_queuing_retries_or_reusing_its_text() {
+        block_on(async {
+            let lane = Arc::new(tokio::sync::Semaphore::new(1));
+            let started = Arc::new(tokio::sync::Notify::new());
+            let finish = Arc::new(tokio::sync::Notify::new());
+            let signal = started.clone();
+            let release = finish.clone();
+            let worker_lane = lane.clone();
+            let caller = tokio::spawn(async move {
+                bounded_background(&worker_lane, async move {
+                    signal.notify_one();
+                    release.notified().await;
+                    Ok("old screenshot text")
+                })
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(2), started.notified())
+                .await
+                .unwrap();
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+            let extra = Arc::new(AtomicUsize::new(0));
+            for _ in 0..8 {
+                let hits = extra.clone();
+                let rejected = bounded_background(&lane, async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Ok("unexpected screenshot text")
+                })
+                .await;
+                assert!(rejected
+                    .unwrap_err()
+                    .to_string()
+                    .contains("already recognizing"));
             }
-        })
-        .await
-        .unwrap();
-        let fresh = bounded_background(&lane, async { Ok("fresh screenshot text") })
+            assert_eq!(extra.load(Ordering::SeqCst), 0);
+            finish.notify_one();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while lane.available_permits() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
             .unwrap();
-        assert_eq!(fresh, "fresh screenshot text");
-        assert_eq!(
-            extra.load(Ordering::SeqCst),
-            0,
-            "refused retries must never run later"
-        );
+            let fresh = bounded_background(&lane, async { Ok("fresh screenshot text") })
+                .await
+                .unwrap();
+            assert_eq!(fresh, "fresh screenshot text");
+            assert_eq!(
+                extra.load(Ordering::SeqCst),
+                0,
+                "refused retries must never run later"
+            );
+        });
     }
 
-    #[tokio::test]
-    async fn recognition_errors_and_worker_panics_release_the_lane() {
-        let lane = Arc::new(tokio::sync::Semaphore::new(1));
-        let failed: Result<()> =
-            bounded_background(&lane, async { anyhow::bail!("synthetic failure") }).await;
-        assert!(failed.is_err());
-        let panicked: Result<()> =
-            bounded_background(&lane, async { panic!("owned worker fault") }).await;
-        assert!(panicked
-            .unwrap_err()
-            .to_string()
-            .contains("background task"));
-        assert_eq!(bounded_background(&lane, async { Ok(7) }).await.unwrap(), 7);
+    #[test]
+    fn recognition_errors_and_worker_panics_release_the_lane() {
+        block_on(async {
+            let lane = Arc::new(tokio::sync::Semaphore::new(1));
+            let failed: Result<()> =
+                bounded_background(&lane, async { anyhow::bail!("synthetic failure") }).await;
+            assert!(failed.is_err());
+            let panicked: Result<()> =
+                bounded_background(&lane, async { panic!("owned worker fault") }).await;
+            assert!(panicked
+                .unwrap_err()
+                .to_string()
+                .contains("background task"));
+            assert_eq!(bounded_background(&lane, async { Ok(7) }).await.unwrap(), 7);
+        });
     }
 }
