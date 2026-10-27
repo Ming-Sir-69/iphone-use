@@ -102,6 +102,15 @@ FOUNDATION_EXPORT NSString *const IPURNodeAXElementKey;
 
 // MARK: - Accessibility tree
 
+/// Fetches the full AX Value attribute rather than the snapshot's truncated value.
+/// Returned strings are clipped only at scalar boundaries; metadata uses UTF-16 units.
++ (nullable NSDictionary<NSString *, id> *)readValueForAXElement:(id)element
+                                               maxUTF16Length:(NSUInteger)limit
+                                                  placeholder:(nullable NSString *)placeholder
+                                                        error:(NSString *_Nullable *_Nullable)error
+  NS_SWIFT_NAME(readValue(for:maxUTF16:placeholder:error:));
+
+
 /// Snapshots `axElement` through XCAXClient_iOS requestSnapshotForElement:attributes:parameters:error:
 /// with only nine attributes, walking a depth ladder on kAXErrorIllegalArgument and re-rooting
 /// depth-capped frontier nodes (bounded by `extensionCallLimit`). The root is serialized into

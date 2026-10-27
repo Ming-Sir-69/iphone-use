@@ -55,17 +55,23 @@ impl ScriptedDaemon {
                         // mid-response. Both sides get a deadline.
                         stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
                         stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
-                        let mut request = Vec::with_capacity(1_024);
-                        let mut buffer = [0_u8; 1_024];
-                        while request.len() < 8_192 && !request.windows(2).any(|bytes| bytes == b"\r\n") {
-                            let remaining = (8_192 - request.len()).min(buffer.len());
+                        let mut request = Vec::new();
+                        let mut buffer = [0_u8; 8_192];
+                        let read_deadline = Instant::now() + Duration::from_secs(10);
+                        while request.len() < 65_536 && Instant::now() < read_deadline {
+                            let remaining = (65_536 - request.len()).min(buffer.len());
+                            stream.set_read_timeout(Some(read_deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1)))).ok();
                             match stream.read(&mut buffer[..remaining]) {
                                 Ok(0) | Err(_) => break,
                                 Ok(count) => request.extend_from_slice(&buffer[..count]),
                             }
+                            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                                let length = String::from_utf8_lossy(&request[..end]).lines()
+                                    .find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|value| value.trim().parse::<usize>().ok())).unwrap_or(0);
+                                if request.len() >= end + 4 + length { break; }
+                            }
                         }
-                        let line_end = request.windows(2).position(|bytes| bytes == b"\r\n").unwrap_or(request.len());
-                        seen.lock().unwrap().push(String::from_utf8_lossy(&request[..line_end]).into_owned());
+                        seen.lock().unwrap().push(String::from_utf8_lossy(&request).into_owned());
                         let status_read = request.windows(2).any(|bytes| bytes == b"\r\n")
                             && request.starts_with(b"GET /agent/status ");
                         if status_read { std::thread::sleep(delay); }
@@ -618,4 +624,42 @@ fn reconnect_wait_transient_blocker_does_not_end_a_short_budget_early() {
     assert_eq!(body["wait"]["outcome"], "timeout", "{body}");
     assert!(started.elapsed() < Duration::from_secs(2));
     assert_eq!(daemon.requests.lock().unwrap().iter().filter(|r| r.starts_with("POST /agent/mode ")).count(), 1);
+}
+
+#[test]
+fn full_value_is_single_copy_and_never_requests_control_in_all_output_modes() {
+    let value = "value-root-".to_string() + &"字".repeat(6015);
+    for mode in ["full", "slim", "off"] {
+        let body = serde_json::json!({"ok":true,"value":value,"source":"ax_value_attribute","complete":true,"truncated":false,
+            "utf16_length":6026,"returned_utf16_length":6026,"limit_utf16":8192});
+        let daemon = ScriptedDaemon::start("200 OK",body.to_string().into_bytes());
+        let home = tempfile::tempdir().unwrap();
+        let mut child = McpChild::start_options(&daemon.url,mode,&[("HOME",home.path().to_str().unwrap()),
+            ("IPHONE_USE_MCP_TOOLS","readonly"),("IPHONE_USE_MCP_PREWARM","0"),("IPHONE_USE_FLOWS_NO_AUTO_UPDATE","1")]);
+        let reply = child.call_tool(2,"phone_read_value",serde_json::json!({"identifier":"field-a"}));
+        let result = &reply["result"];
+        assert_ne!(result["isError"],true,"{reply}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(text).unwrap()["value"],value);
+        assert_eq!(reply.to_string().matches(&value).count(),1);
+        assert!(result.get("structuredContent").is_none() || result["structuredContent"].is_null(), "a metadata-only structured result hides the text in some hosts: {reply}");
+        let requests = daemon.requests.lock().unwrap();
+        assert_eq!(requests.len(),1);
+        assert!(requests[0].starts_with("POST /agent/value "));
+        assert!(!requests[0].to_ascii_lowercase().contains("x-phone-control:"));
+    }
+}
+#[test]
+fn missing_contract_and_revoked_scope_never_publish_a_value() {
+    for body in [serde_json::json!({"ok":true,"value":"UNTRUSTED_PREVIEW"}),
+        serde_json::json!({"ok":false,"error":"value_read_scope_changed","value_omitted":true,"value":"WITHHELD_SECRET"})] {
+        for mode in ["full","slim","off"] {
+            let daemon = ScriptedDaemon::start("200 OK",body.to_string().into_bytes());
+            let mut child = McpChild::start_with(&daemon.url,mode);
+            let reply = child.call_tool(2,"phone_read_value",serde_json::json!({"identifier":"field-a"}));
+            assert_eq!(reply["result"]["isError"],true,"{reply}");
+            let wire=reply.to_string();
+            assert!(!wire.contains("UNTRUSTED_PREVIEW") && !wire.contains("WITHHELD_SECRET"));
+        }
+    }
 }

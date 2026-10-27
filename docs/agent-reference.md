@@ -835,7 +835,7 @@ worked example below.
 
 ## MCP specifics
 
-39 tools (one, `phone_screen_frame`, is hidden from the model and used only by the live screen panel): `phone_status`, `phone_screen`, `phone_capabilities`, `phone_reconnect`, `phone_hold`,
+40 tools (one, `phone_screen_frame`, is hidden from the model and used only by the live screen panel): `phone_status`, `phone_screen`, `phone_capabilities`, `phone_read_value`, `phone_reconnect`, `phone_hold`,
 `phone_release_owner`, `phone_login`, `phone_apps`, `phone_screenshot`, `phone_elements`, `phone_home_layout`, `phone_instances`, `phone_tap`,
 `phone_tap_element`, `phone_tap_label`, `phone_scroll`, `phone_scroll_find`, `phone_collect_list`, `phone_type`,
 `phone_key`, `phone_shortcut`, `phone_run_steps`, `phone_jev_run`,
@@ -1352,10 +1352,29 @@ waiting, rather than guessing another target. This selects an installed daemon;
 it never changes a daemon's phone configuration or bypasses handoff/privacy/owner gates.
 
 
-OCR batch waits retain the privacy generation from request entry. A private
+All observing batches retain the privacy generation from request entry. A private
 on/off transition cancels that observation and later steps; queued response
-bodies withhold OCR diagnostics while preserving known action delivery receipts.
+bodies withhold screen observations and wait verdicts while preserving known action delivery receipts.
 `phone_reconnect(wait_secs=N)` bounds each status read by the remaining wait
 budget and returns `stopped` for recorded phone exit, parking or human handoff.
 Only the initial reconnect request can start recovery; waiting never sends a
 second reconnect.
+
+### Complete selected AX values
+
+`POST /agent/value` (MCP `phone_read_value`) reads one current AX value selected
+by exactly one `identifier` or exact `label`, optionally `kind`. It never taps,
+focuses, unlocks, or takes a control lease. Ambiguous selectors refuse. Secure
+fields require a person; an older Runner without `ipu:valueRead` refuses rather
+than passing off a snapshot preview as full text.
+
+`max_utf16` is 1–65536 (default 8192). The reply carries `source`, `complete`,
+`truncated`, `utf16_length`, `returned_utf16_length` and `limit_utf16`. Clipping
+preserves surrogate pairs. Complete means this API did not clip the AX attribute;
+it does not prove that an app exposes its entire document. Owner changes, lease
+expiry, privacy changes or a control transition withhold an in-flight or queued
+value. Same-owner renewal and cleanup of an already expired owner preserve fresh
+permitted reads. Plan a fresh read only after checking current status.
+
+The Native complete-value route is explicitly opted into with `complete=1`;
+existing attribute/value snapshot reads and POST value writes keep their contracts.

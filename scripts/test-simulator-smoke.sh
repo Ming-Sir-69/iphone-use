@@ -88,6 +88,13 @@ bytes="$(printf '%s' "$body" | json 'd["summary"]["bytes"]')" || bad "record sto
 [ "$bytes" -gt 0 ] || bad "empty recording: $body"
 ok_t "recording via simctl recordVideo saved $bytes bytes"
 
+# Complete-value reads use a separate seeded App and must not acquire a lease.
+curl -fsS -m 30 "${H[@]}" -X POST "$B/agent/owner" -d '{"release":true}' >/dev/null || bad "release owner before value reads"
+python3 "$ROOT/scripts/test-value-read-simulator.py" --base "$B" --udid "$SIM" \
+    --owner smoke --mcp "$BIN/iphone-use-mcp" --runner-record "$STATE/simulator.json" \
+    --out "$STATE/value-read" || bad "complete value read conformance failed"
+ok_t "complete AX values, scalar clipping, secure refusal and real MCP preserve App state"
+
 # Verify UIKit-observed input, including timed hover and a no-hover control.
 python3 "$ROOT/scripts/test-drag-simulator.py" --base "$B" --udid "$SIM" \
     --input-readiness \

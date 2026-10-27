@@ -67,6 +67,7 @@ fn fixture_app_state(password: Option<&str>) -> Arc<AppState> {
         privacy_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         private_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
         owner: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        owner_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         owner_lease_secs: 300,
         // Never launchd: a test that reconnects swaps in its own fake.
         runner_bootstrap: |_, _, _| false,

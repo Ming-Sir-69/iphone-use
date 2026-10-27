@@ -31,10 +31,15 @@ class Daemon(http.server.BaseHTTPRequestHandler):
     def respond(self):
         body = self.rfile.read(int(self.headers.get('Content-Length', '0')))
         with seen_lock:
-            seen.append((self.server.name, self.command, self.path, self.headers.get('Authorization'), body))
+            seen.append((self.server.name, self.command, self.path, self.headers.get('Authorization'), body, self.headers.get('X-Phone-Control')))
         if self.path.startswith('/agent/capabilities'):
             value = {'ok': True, 'operations': {'single': ['tap', 'type'],
                 'batch': {'max': 24}}, 'limits': {'nested': {'value': 'x' * 300}}}
+        elif self.path.startswith('/agent/value'):
+            text = 'value-' + self.server.name
+            value = {'ok': True, 'value': text, 'source': 'ax_value_attribute',
+                'utf16_length': len(text), 'returned_utf16_length': len(text),
+                'limit_utf16': 8192, 'complete': True, 'truncated': False}
         elif self.path.startswith('/agent/elements'):
             value = {'ok': True, 'snapshot': self.server.name, 'elements': []}
         elif self.command == 'POST':
@@ -125,6 +130,14 @@ try:
                 assert result['_meta']['openai/widgetSessionId'].endswith(instance)
                 assert seen[-1][0] == marker and seen[-1][3] == 'Bearer ' + token
                 assert 'result' in call('phone_elements', instance=instance)
+            for instance, marker, token in [('i13','B','token-B'),('default','A','token-A')]:
+                reply = call('phone_read_value', instance=instance, identifier='field-a')['result']
+                assert not reply.get('isError'), reply
+                decoded = next(json.loads(item['text']) for item in reply['content']
+                    if item.get('type') == 'text' and item.get('text','').startswith('{'))
+                assert decoded['value'] == 'value-' + marker
+                assert seen[-1][0] == marker and seen[-1][3] == 'Bearer ' + token
+                assert seen[-1][1] == 'POST' and seen[-1][5] is None, 'read must not claim control'
             capabilities = call('phone_capabilities', instance='i13')['result']
             assert capabilities['structuredContent'] == {'ok': True,
                 'operations': {'single': ['tap', 'type'], 'batch': {'max': 24}},
