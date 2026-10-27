@@ -1350,3 +1350,12 @@ The live panel waits for its opening tool's selection and uses it for frames
 and Home; a host that does not deliver tool input/result leaves the panel
 waiting, rather than guessing another target. This selects an installed daemon;
 it never changes a daemon's phone configuration or bypasses handoff/privacy/owner gates.
+
+
+OCR batch waits retain the privacy generation from request entry. A private
+on/off transition cancels that observation and later steps; queued response
+bodies withhold OCR diagnostics while preserving known action delivery receipts.
+`phone_reconnect(wait_secs=N)` bounds each status read by the remaining wait
+budget and returns `stopped` for recorded phone exit, parking or human handoff.
+Only the initial reconnect request can start recovery; waiting never sends a
+second reconnect.

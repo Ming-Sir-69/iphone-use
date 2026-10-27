@@ -712,6 +712,11 @@ fn reconnect_brief(status: &crate::types::StatusResponse) -> serde_json::Value {
 
 /// Whether a waiting reconnect is finished, and why.
 fn reconnect_wait_outcome(status: &crate::types::StatusResponse) -> Option<&'static str> {
+    if ["ended_on_phone", "runner_parked", "human_handoff"].iter()
+        .any(|key| status.extra.get(*key).and_then(serde_json::Value::as_bool) == Some(true)) {
+        return Some("stopped");
+    }
+
     if status
         .setup_blocked_on
         .as_deref()
@@ -1780,7 +1785,7 @@ impl PhoneHandler {
         or a blocker remains. Once these conditions are met, call once, \
         then wait for the outcome: pass wait_secs (e.g. 180) to block until drivable=true, \
         a blocker (setup_blocked_on), or the timeout, instead of polling phone_status; \
-        `wait.outcome` is drivable, blocked or timeout. While it is reconnecting, report \
+        `wait.outcome` is drivable, blocked, stopped or timeout. While it is reconnecting, report \
         setup_phase/setup_message and obey setup_blocked_on. This tool \
         never accepts a UDID and cannot switch devices. \
         An externally managed runner returns an operator-owned recovery error."
@@ -1813,9 +1818,17 @@ impl PhoneHandler {
         let started = tokio::time::Instant::now();
         let deadline = started + std::time::Duration::from_secs(wait_secs);
         let mut last_status = None;
-        let mut last_error: Option<String>;
+        let mut last_error: Option<String> = None;
         let outcome = loop {
-            match self.daemon.status().await {
+            if tokio::time::Instant::now() >= deadline { break "timeout"; }
+            let status = match tokio::time::timeout_at(deadline, self.daemon.status()).await {
+                Ok(status) => status,
+                Err(_) => {
+                    last_error = Some("status read exceeded the remaining wait budget".to_string());
+                    break "timeout";
+                }
+            };
+            match status {
                 Ok(status) => {
                     let done = reconnect_wait_outcome(&status);
                     last_status = Some(status);

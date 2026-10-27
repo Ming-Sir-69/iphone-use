@@ -11544,6 +11544,7 @@ async fn agent_wait_ocr(
     state: &AppState,
     w: &mut crate::runner::RunnerClient,
     expect: &AgentUiExpectation,
+    generation: u64,
     wait_deadline: tokio::time::Instant,
     poll_ms: u64,
 ) -> OcrWait {
@@ -11553,13 +11554,15 @@ async fn agent_wait_ocr(
     let mut last_observation = serde_json::Value::Null;
     let mut last_error: Option<String>;
     loop {
-        if state.screen_private_secs() > 0 {
+        if private_read_refusal(state, generation).is_some() {
             return OcrWait::Private;
         }
         attempts += 1;
-        match agent_ocr_read(w, wait_deadline).await {
+        let Some(read) = unless_private(&state.private_until, &state.privacy_epoch, generation,
+            agent_ocr_read(w, wait_deadline)).await else { return OcrWait::Private; };
+        match read {
             Ok(texts) => {
-                if state.screen_private_secs() > 0 {
+                if private_read_refusal(state, generation).is_some() {
                     return OcrWait::Private;
                 }
                 reads += 1;
@@ -11576,6 +11579,7 @@ async fn agent_wait_ocr(
             }
             Err(error) => last_error = Some(error),
         }
+        if private_read_refusal(state, generation).is_some() { return OcrWait::Private; }
         if tokio::time::Instant::now() >= wait_deadline {
             let mut observation = if last_observation.is_null() {
                 serde_json::json!({
@@ -11881,6 +11885,21 @@ async fn agent_actions_inner(
     headers: HeaderMap,
     body: String,
 ) -> Response {
+    let generation = state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire);
+    let uses_ocr = serde_json::from_str::<AgentActionsRequest>(&body).ok().is_some_and(|request|
+        request.steps.iter().any(|step| matches!(step, AgentActionStep::WaitFor { expect, .. } if expect.uses_ocr())));
+    let mut response = agent_actions_generation(State(state.clone()), headers, body, generation).await;
+    if uses_ocr && !refused_as_unauthenticated(&response) {
+        response.extensions_mut().insert(BatchPrivacyFence {
+            private_until: state.private_until.clone(), epoch: state.privacy_epoch.clone(), generation,
+        });
+    }
+    response
+}
+
+async fn agent_actions_generation(
+    State(state): State<Arc<AppState>>, headers: HeaderMap, body: String, privacy_generation: u64,
+) -> Response {
     match agent_auth(&state, &headers) {
         AgentAuth::Locked => {
             return with_security_headers(
@@ -11914,10 +11933,11 @@ async fn agent_actions_inner(
     if let Err(error) = validate_agent_actions(&request) {
         return agent_actions_invalid(error);
     }
+    let uses_ocr = request.steps.iter().any(|step| matches!(step, AgentActionStep::WaitFor { expect, .. } if expect.uses_ocr()));
     let observes_screen = request.observe || request.steps.iter().any(|step| {
         matches!(step, AgentActionStep::WaitFor { .. })
     });
-    if observes_screen && state.screen_private_secs() > 0 {
+    if observes_screen && (state.screen_private_secs() > 0 || (uses_ocr && state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire) != privacy_generation)) {
         return private_batch_refusal(0, 0, 0);
     }
     // `launch_app {"app": …}` becomes a bundle before the first step runs, so
@@ -12022,7 +12042,7 @@ async fn agent_actions_inner(
     let mut applied_actions = 0_usize;
     let mut step_results = Vec::with_capacity(request.steps.len());
     for (index, step) in request.steps.iter().enumerate() {
-        if observes_screen && state.screen_private_secs() > 0 {
+        if observes_screen && (state.screen_private_secs() > 0 || (uses_ocr && state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire) != privacy_generation)) {
             return private_batch_refusal(index, completed, applied_actions);
         }
         if state.runner_lifecycle.is_transitioning()
@@ -12370,7 +12390,7 @@ async fn agent_actions_inner(
                     wait_started + std::time::Duration::from_millis(*timeout_ms),
                 );
                 if expect.uses_ocr() {
-                    match agent_wait_ocr(&state, &mut w, expect, wait_deadline, *poll_ms).await {
+                    match agent_wait_ocr(&state, &mut w, expect, privacy_generation, wait_deadline, *poll_ms).await {
                         OcrWait::Matched(observation) => {
                             step_results.push(serde_json::json!({
                                 "index": index,
@@ -12577,7 +12597,7 @@ async fn agent_actions_inner(
         completed += 1;
     }
 
-    if observes_screen && state.screen_private_secs() > 0 {
+    if observes_screen && (state.screen_private_secs() > 0 || (uses_ocr && state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire) != privacy_generation)) {
         return private_batch_refusal(completed, completed, applied_actions);
     }
     state.touch_activity();
@@ -12656,7 +12676,7 @@ async fn agent_actions_inner(
     }
     // A person can start a private hold while a read is in flight. Discard
     // every observation, including earlier step text, before returning it.
-    if observes_screen && state.screen_private_secs() > 0 {
+    if observes_screen && (state.screen_private_secs() > 0 || (uses_ocr && state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire) != privacy_generation)) {
         return private_batch_refusal(completed, completed, applied_actions);
     }
     agent_actions_json(StatusCode::OK, result)
@@ -15934,6 +15954,13 @@ fn finish_private_read(state: &AppState, generation: u64, response: Response) ->
 }
 
 #[derive(Clone)]
+struct BatchPrivacyFence {
+    private_until: Arc<Mutex<Option<Instant>>>,
+    epoch: Arc<std::sync::atomic::AtomicU64>,
+    generation: u64,
+}
+
+#[derive(Clone)]
 struct ReadPrivacyFence {
     private_until: Arc<Mutex<Option<Instant>>>,
     privacy_epoch: Arc<std::sync::atomic::AtomicU64>,
@@ -15944,6 +15971,26 @@ struct ReadPrivacyFence {
 /// fence or lose its fixed-size timing/metrics enrichment before it is installed.
 async fn privacy_read_body_layer(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let response = next.run(request).await;
+    if let Some(fence) = response.extensions().get::<BatchPrivacyFence>().cloned() {
+        let (mut parts, body) = response.into_parts();
+        let bytes = match axum::body::to_bytes(body, 2 << 20).await {
+            Ok(bytes) => bytes,
+            Err(_) => return json_response(StatusCode::BAD_GATEWAY,
+                serde_json::json!({"ok":false,"error":"outcome_unknown","outcome":"unknown","retry_safe":false})),
+        };
+        parts.headers.remove(header::CONTENT_LENGTH);
+        let stream = futures_util::stream::once(async move {
+            let revoked = fence.epoch.load(std::sync::atomic::Ordering::Acquire) != fence.generation
+                || screen_private_now(&fence.private_until);
+            let bytes = if revoked {
+                let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                bytes::Bytes::from(crate::observation::redact(value,"screen_privacy_changed").to_string())
+            } else { bytes };
+            Ok::<_, std::io::Error>(bytes)
+        });
+        return Response::from_parts(parts, Body::from_stream(stream));
+    }
+
     let Some(fence) = response.extensions().get::<ReadPrivacyFence>().cloned() else { return response; };
     // The response can sit queued before the HTTP writer first polls its body.
     use futures_util::StreamExt;
