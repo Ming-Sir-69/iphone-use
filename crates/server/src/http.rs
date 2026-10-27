@@ -476,6 +476,8 @@ pub struct AppState {
     pub owner: Arc<Mutex<Option<PhoneOwner>>>,
     /// How long an owner's lease outlives its last control request.
     pub owner_lease_secs: u64,
+    /// Ownership incarnation, including release and same-name reacquisition.
+    pub owner_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// How a reconnect brings the managed supervisor up: `(setup_sh, log,
     /// udid) -> started`. Blocking. The daemon uses
     /// [`write_and_bootstrap_runner_agent`]; tests substitute a fake so a
@@ -627,6 +629,11 @@ fn claim_phone_owner(state: &AppState, headers: &HeaderMap) -> Result<bool, Resp
     let mut slot = recover(state.owner.lock());
     let previous = slot.clone();
     let outcome = arbitrate_owner(&mut slot, claim, now, lease);
+    if outcome.is_ok() {
+        let before = previous.as_ref().filter(|o| now.saturating_duration_since(o.last_seen) < lease).map(|o| &o.name);
+        let after = slot.as_ref().map(|o| &o.name);
+        if before != after { state.owner_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel); }
+    }
     drop(slot);
     match outcome {
         Ok(()) => {
@@ -744,7 +751,7 @@ async fn agent_owner_inner(
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         );
     }
-    *recover(state.owner.lock()) = None;
+    state.release_owner_lease();
     // While a lease is live the idle watchdog leaves the phone alone; the
     // idle window starts when it is given back, not at the last action.
     state.touch_activity();
@@ -766,6 +773,12 @@ pub type ElementSnapshotCache =
     std::collections::VecDeque<(String, Arc<Vec<crate::runner::ElementRow>>)>;
 
 impl AppState {
+    fn release_owner_lease(&self) {
+        let mut owner = recover(self.owner.lock());
+        *owner = None;
+        self.owner_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
     /// Stamp "remote driving happened just now" for the idle-release watchdog.
     /// Called by every `/agent` action and live-view request (NOT `/agent/status`,
     /// which the web client polls constantly — counting it would pin the phone
@@ -1022,6 +1035,7 @@ fn api_routes() -> Router<Arc<AppState>> {
         .route("/agent/h264/keyframe", post(agent_h264_keyframe))
         .route("/agent/elements", get(agent_elements))
         .route("/agent/activity", get(agent_activity))
+        .route("/agent/value", post(agent_value))
         .route("/agent/collect", post(agent_collect))
         .route("/agent/scroll_find", post(agent_scroll_find))
         .route("/agent/flow/draft", get(agent_flow_draft))
@@ -4824,7 +4838,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                     *recover(state.runner_health.lock()) = crate::runner::RunnerHealth::down();
                     state.released.store(true, Ordering::Release);
                     recover(state.flow_trail.lock()).reset();
-                    *recover(state.owner.lock()) = None;
+                    state.release_owner_lease();
                     note_idle_release();
                     release_backoff_until = None;
                     release_failures = 0;
@@ -4938,7 +4952,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 *recover(state.runner_health.lock()) = crate::runner::RunnerHealth::down();
                 state.released.store(true, Ordering::Release);
                 recover(state.flow_trail.lock()).reset();
-                *recover(state.owner.lock()) = None;
+                state.release_owner_lease();
                 note_idle_release();
                 was_up = false;
                 release_backoff_until = None;
@@ -5309,7 +5323,7 @@ fn spawn_phone_exit_watch(state: Arc<AppState>) {
                 *recover(state.runner_health.lock()) = crate::runner::RunnerHealth::down();
                 state.released.store(true, Ordering::Release);
                 recover(state.flow_trail.lock()).reset();
-                *recover(state.owner.lock()) = None;
+                state.release_owner_lease();
                 tracing::info!("the session was ended on the iPhone; phone released until the next request");
             }
             state.runner_lifecycle.finish_releasing(release_token);
@@ -6171,7 +6185,7 @@ async fn agent_mode_inner(
                 state
                     .released
                     .store(true, std::sync::atomic::Ordering::Release);
-                *recover(state.owner.lock()) = None;
+                state.release_owner_lease();
                 if let Err(error) = persist_human_handoff(true) {
                     tracing::error!(%error, "phone stopped but human handoff could not be persisted");
                     persisted = false;
@@ -12656,6 +12670,196 @@ async fn agent_actions_inner(
     agent_actions_json(StatusCode::OK, result)
 }
 
+#[derive(Clone)]
+struct ValueReadScope { epoch: u64, privacy_epoch: u64, owner: Option<String> }
+impl ValueReadScope {
+    fn capture(state: &AppState) -> Self {
+        let owner = recover(state.owner.lock());
+        let now = Instant::now();
+        let lease = std::time::Duration::from_secs(state.owner_lease_secs);
+        Self {
+            epoch: state.owner_epoch.load(std::sync::atomic::Ordering::Acquire),
+            privacy_epoch: state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire),
+            owner: owner.as_ref().filter(|owner| now.saturating_duration_since(owner.last_seen) < lease)
+                .map(|owner| owner.name.clone()),
+        }
+    }
+    fn current(&self, state: &AppState) -> bool {
+        let owner_matches = {
+            let owner = recover(state.owner.lock());
+            let now = Instant::now();
+            let lease = std::time::Duration::from_secs(state.owner_lease_secs);
+            self.epoch == state.owner_epoch.load(std::sync::atomic::Ordering::Acquire)
+                && self.owner.as_deref() == owner.as_ref()
+                    .filter(|owner| now.saturating_duration_since(owner.last_seen) < lease)
+                    .map(|owner| owner.name.as_str())
+        };
+        owner_matches
+            && self.privacy_epoch == state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire)
+            && !screen_private_now(&state.private_until)
+            && !state.released.load(std::sync::atomic::Ordering::Acquire)
+            && !state.runner_lifecycle.is_transitioning()
+    }
+}
+async fn scoped_value_read<T>(state: &AppState, scope: &ValueReadScope, work: impl std::future::Future<Output=T>) -> Option<T> {
+    tokio::pin!(work);
+    loop {
+        if !scope.current(state) { return None; }
+        if let Ok(value) = tokio::time::timeout(std::time::Duration::from_millis(250), &mut work).await {
+            return scope.current(state).then_some(value);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ValueReadFence {
+    state: Arc<AppState>,
+    scope: ValueReadScope,
+}
+fn value_scope_failure() -> serde_json::Value {
+    serde_json::json!({"ok":false,"error":"value_read_scope_changed","value_omitted":true,"hint":"The value was withheld after owner/privacy changed; check current status before a fresh read"})
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValueReadRequest {
+    identifier: Option<String>,
+    label: Option<String>,
+    kind: Option<String>,
+    max_utf16: Option<u32>,
+}
+async fn agent_value(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let scope = ValueReadScope::capture(&state);
+    match agent_auth(&state, &headers) {
+        AgentAuth::Ok => {}
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
+        }
+    }
+    if let Some(refused) = screen_private_refusal(&state) {
+        return refused;
+    }
+    if state.released.load(std::sync::atomic::Ordering::Acquire)
+        || state.runner_lifecycle.is_transitioning()
+    {
+        return json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"ok":false,"error":"device_unavailable"}),
+        );
+    }
+    let request = match serde_json::from_str::<ValueReadRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return invalid_list_request("invalid value-read request".into()),
+    };
+    let selector = match (request.identifier.as_deref(), request.label.as_deref()) {
+        (Some(id), None) if !id.is_empty() && id.chars().count() <= 512 => {
+            format!("identifier == {}", runner_predicate_literal(id))
+        }
+        (None, Some(label)) if !label.is_empty() && label.chars().count() <= 512 => {
+            format!("label == {}", runner_predicate_literal(label))
+        }
+        _ => {
+            return invalid_list_request(
+                "give exactly one nonempty identifier or label, at most 512 characters".into(),
+            )
+        }
+    };
+    let limit = request.max_utf16.unwrap_or(8192);
+    if !(1..=65536).contains(&limit) {
+        return invalid_list_request("max_utf16 must be 1...65536".into());
+    }
+    let selector = if let Some(kind) = request.kind {
+        if kind.is_empty() || kind.len() > 80 {
+            return invalid_list_request("invalid kind".into());
+        }
+        if kind.trim_start_matches("XCUIElementType") == "SecureTextField" {
+            return json_response(StatusCode::FORBIDDEN,
+                serde_json::json!({"ok":false,"error":"secure_value_read_requires_human"}));
+        }
+        format!(
+            "({selector}) AND type == {}",
+            runner_predicate_literal(&format!(
+                "XCUIElementType{}",
+                kind.trim_start_matches("XCUIElementType")
+            ))
+        )
+    } else {
+        selector
+    };
+    let Some(runner) = &state.runner else {
+        return ControlRefusal::runner_not_configured().into_response();
+    };
+    state.touch_activity();
+    let work = scoped_value_read(&state, &scope, async {
+        let _priority = state.begin_runner_control();
+        let mut client = runner.lock().await;
+        let ids = client.find_elements("predicate string", &selector).await?;
+        if ids.len() != 1 {
+            return Ok::<_, anyhow::Error>(Err(if ids.is_empty() {
+                "element_not_found"
+            } else {
+                "ambiguous_element"
+            }));
+        }
+        client.read_element_value(&ids[0], limit).await.map(Ok)
+    });
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(15), work).await;
+    let current = || scope.current(&state);
+    let mut response = if !current() {
+        json_response(StatusCode::CONFLICT, value_scope_failure())
+    } else {
+        match outcome {
+            Ok(Some(Ok(Ok(mut value)))) if core::value_read::valid_contract(&value, limit) => {
+                value["ok"] = true.into();
+                json_response(StatusCode::OK, value)
+            }
+            Ok(Some(Ok(Err(error)))) => json_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                serde_json::json!({"ok":false,"error":error}),
+            ),
+            Err(_) => json_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                serde_json::json!({"ok":false,"error":"value_read_timeout"}),
+            ),
+            Ok(Some(Err(error)))
+                if crate::runner::runner_http_error(&error).is_some_and(|e| {
+                    e.message
+                        .as_deref()
+                        .is_some_and(|message| message.contains("secure_value_read_requires_human"))
+                }) =>
+            {
+                json_response(
+                    StatusCode::FORBIDDEN,
+                    serde_json::json!({"ok":false,"error":"secure_value_read_requires_human"}),
+                )
+            }
+            Ok(None) => json_response(StatusCode::CONFLICT, value_scope_failure()),
+            Ok(Some(Err(ref error))) if !crate::runner::runner_http_error(error).is_some_and(|e|
+                e.status.as_u16() == 501 || matches!(e.code.as_deref(), Some("unknown command" | "unsupported operation"))) =>
+                json_response(StatusCode::BAD_GATEWAY,
+                    serde_json::json!({"ok":false,"error":"value_read_failed","retry_safe":true})),
+            _ => json_response(
+                StatusCode::NOT_IMPLEMENTED,
+                serde_json::json!({"ok":false,"error":"full_value_unavailable","hint":"The runner did not supply a complete-value contract; upgrade it or use a permitted alternative read. No preview was promoted to a full value"}),
+            ),
+        }
+    };
+    response
+        .extensions_mut()
+        .insert(ValueReadFence { state, scope });
+    response
+}
+
 // ---------------------------------------------------------------------------
 // /agent/collect and /agent/scroll_find: read a list across pages, or look
 // for one label, swiping on the agent's behalf (see `crate::collect`).
@@ -15938,6 +16142,20 @@ struct ReadPrivacyFence {
 /// fence or lose its fixed-size timing/metrics enrichment before it is installed.
 async fn privacy_read_body_layer(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let response = next.run(request).await;
+    if let Some(fence) = response.extensions().get::<ValueReadFence>().cloned() {
+        let (mut parts, body) = response.into_parts();
+        let bytes = match axum::body::to_bytes(body, 1 << 20).await {
+            Ok(bytes) => bytes,
+            Err(_) => return json_response(StatusCode::BAD_GATEWAY, value_scope_failure()),
+        };
+        parts.headers.remove(header::CONTENT_LENGTH);
+        let stream = futures_util::stream::once(async move {
+            let bytes = if fence.scope.current(&fence.state) { bytes }
+                else { bytes::Bytes::from(value_scope_failure().to_string()) };
+            Ok::<_, std::io::Error>(bytes)
+        });
+        return Response::from_parts(parts, Body::from_stream(stream));
+    }
     let Some(fence) = response.extensions().get::<ReadPrivacyFence>().cloned() else { return response; };
     // The response can sit queued before the HTTP writer first polls its body.
     use futures_util::StreamExt;
