@@ -553,16 +553,20 @@ fn failed_capture_clears_old_pixels_despite_racing_open_status() {
 
 #[test]
 fn registry_without_flows_does_not_query_phone_inventory() {
-    for registry in [None, Some(serde_json::json!({"installed":0,"next":"No saved flows"})),
-        Some(serde_json::json!({"flows":[]})), Some(serde_json::json!({"flows":null})),
-        Some(serde_json::json!({"flows":[{"id":"fixture/flow"}]}))] {
-        let needs_inventory = registry.as_ref().and_then(|value|value["flows"].as_array()).is_some_and(|flows| !flows.is_empty());
+    for (registry, needs_inventory) in [
+        (None, false),
+        (Some(serde_json::json!({"installed":0,"next":"No saved flows"})), false),
+        (Some(serde_json::json!({"flows":[]})), false),
+        (Some(serde_json::json!({"flows":null})), false),
+        (Some(serde_json::json!({"flows":[{"id":"fixture/flow"}]})), true),
+    ] {
         let mut body = serde_json::json!({"ok":true,"snapshot":"S","elements":[{"kind":"TextField","identifier":"field-a","label":"registry"}]});
         if let Some(registry) = registry { body["registry"] = registry; }
         let daemon = ScriptedDaemon::start("200 OK", body.to_string().into_bytes());
         let home = tempfile::tempdir().unwrap();
         let mut child = McpChild::start_options(&daemon.url,"off",&[
-            ("HOME",home.path().to_str().unwrap()),("IPHONE_USE_FLOWS_NO_AUTO_UPDATE","1"),
+            ("HOME",home.path().to_str().unwrap()),("IPHONE_USE_FLOWS_DIR",home.path().to_str().unwrap()),
+            ("IPHONE_USE_FLOWS_NO_AUTO_UPDATE","1"),
             ("IPHONE_USE_MCP_PREWARM","0")]);
         let reply = child.call_tool(2,"phone_elements",serde_json::json!({}));
         assert!(reply.get("result").is_some() && reply["result"]["isError"] != true,"{reply}");
