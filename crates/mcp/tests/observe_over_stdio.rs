@@ -49,9 +49,17 @@ impl ScriptedDaemon {
                         // mid-response. Both sides get a deadline.
                         stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
                         stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
-                        let mut buffer = [0_u8; 8_192];
-                        let count = stream.read(&mut buffer).unwrap_or(0);
-                        let status_read = buffer[..count].starts_with(b"GET /agent/status ");
+                        let mut request = Vec::with_capacity(1_024);
+                        let mut buffer = [0_u8; 1_024];
+                        while request.len() < 8_192 && !request.windows(2).any(|bytes| bytes == b"\r\n") {
+                            let remaining = (8_192 - request.len()).min(buffer.len());
+                            match stream.read(&mut buffer[..remaining]) {
+                                Ok(0) | Err(_) => break,
+                                Ok(count) => request.extend_from_slice(&buffer[..count]),
+                            }
+                        }
+                        let status_read = request.windows(2).any(|bytes| bytes == b"\r\n")
+                            && request.starts_with(b"GET /agent/status ");
                         let truncated = status == "200 Truncated" && !status_read;
                         let response_status = if status_read && status_body.is_some() || truncated { "200 OK" } else { status };
                         let body = if status_read { status_body.as_ref().unwrap_or(&body) } else { &body };

@@ -260,7 +260,7 @@
       if (step) text += " — " + step;
     }
     if (body.private_secs || body.clear_frame) {
-      setStatus("warn", describe(body));
+      setStatus(body.private_secs ? "warn" : tone, body.private_secs ? describe(body) : text);
       clearFrame(body.private_secs
         ? t("Someone is signing in on the phone. The screen stays hidden until the agent continues.")
         : t("Waiting for a new permitted frame."));

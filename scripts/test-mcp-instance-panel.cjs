@@ -68,10 +68,16 @@ function panel(body={released:true,drivable:false,phone:'mock'}) {
   const frame={drivable:true,frame:{mime_type:'image/png',data:'fixture'}};
   const privacy=panel(frame);privacy.input({});await privacy.flush();
   assert.equal(privacy.element('image').hidden,false);
-  delete frame.frame;frame.clear_frame=true;
+  delete frame.frame;frame.clear_frame=true;frame.error="capture refused";
   await privacy.element('refresh').events.click();await privacy.flush();
   assert.equal(privacy.element('image').hidden,true,'capture refusal clears previously displayed pixels');
   assert.equal(privacy.element('image').src,undefined);
+  assert(privacy.element('status-text').textContent.includes('capture refused'));
+  delete frame.error;frame.drivable=false;frame.next_step='Reconnect explicitly';
+  await privacy.element('refresh').events.click();await privacy.flush();
+  assert(privacy.element('status-text').textContent.includes('Reconnect explicitly'));
+  delete frame.next_step;frame.drivable=true;
+
   frame.clear_frame=false;frame.frame={mime_type:'image/png',data:'new-fixture'};
   await privacy.element('refresh').events.click();await privacy.flush();
   assert.equal(privacy.element('image').hidden,false);
