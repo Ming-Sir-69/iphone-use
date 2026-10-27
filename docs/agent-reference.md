@@ -102,7 +102,9 @@ simulator start` again.
 
 **Reconnect** only when the current task needs the phone, `recovery_owner` is
 `daemon`, blockers are resolved, and no release/reconnect is in progress. Send
-it once, then poll status until `drivable:true`:
+it once, then poll status until `drivable:true` (MCP: `phone_reconnect` with
+`wait_secs`, e.g. 180, does the polling and returns `wait.outcome`
+`drivable` / `blocked` / `timeout` with the compact final status):
 
 ```bash
 curl -s -H "$AUTH" -H "$MUTATION" -H 'Content-Type: application/json' \
@@ -330,7 +332,7 @@ Coordinates are normalized `[0,1]` (`0,0` top-left).
 
 ```jsonc
 {"type":"launch_app","bundle":"com.apple.Health"}       // or "name":"健康" for built-in apps
-{"type":"launch_app","app":"微信"}                       // any app's exact name; 422 ambiguous_app|app_not_found|app_not_installed (+candidates), nothing sent
+{"type":"launch_app","app":"微信"}                       // any app's exact name, or a loose name that starts a word of exactly ONE installed app ("idol ludo" → Idol Ludo Board); the step result's `resolved` {app,name,bundle_id,match} says which; 422 ambiguous_app|app_not_found|app_not_installed (+candidates), nothing sent
 {"type":"open_url","url":"https://example.com/page"}    // http/https always; other schemes only if the owner allows them (403 url_scheme_not_allowed)
 {"type":"tap","element":3,"snapshot":"…"}               // from the SAME elements read
 {"type":"tap","label":"新备忘录"}                         // exact, unique; add "kind":"Button" if a StaticText shares it
@@ -540,6 +542,13 @@ is no longer cached). The action result and the observation are separate facts:
 - Keep `pause` for short animation gaps (maximum 3000 ms). For a slow page such
   as iPhone Storage, use a semantic `wait_for` with `timeout_ms:30000` on the
   expected result instead of chaining pauses.
+- Canvas screens (games, Flutter/Unity) have no labels to wait on. Wait for
+  their text by OCR instead: `{"kind":"wait_for","expect":{"ocr_present":["长按自动"]},"timeout_ms":60000}`
+  (`ocr_absent` for a caption that must disappear, e.g. `Loading`). Each entry
+  matches a recognized line containing it, ignoring case and spaces; each poll
+  is a screenshot plus Vision OCR (about 1 s). An OCR wait may run up to
+  60000 ms, cannot be mixed with `application`/`present`/`absent` in the same
+  step, and on timeout its `observation` lists the `lines` it did read.
 - A failed `wait_for` carries `observation`: `read:false` proves nothing;
   `read:true, stale:true` is the last valid view; plain `read:true` means the
   condition really was not met. Locators an empty tree would have "satisfied" are
