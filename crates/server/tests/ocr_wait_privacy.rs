@@ -207,3 +207,64 @@ fn queued_element_wait_withholds_observation_but_preserves_action_receipt() {
         assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE_BOARD"));
     });
 }
+
+#[test]
+fn busy_ocr_refuses_wait_and_forced_elements_before_another_capture() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    block(async {
+        let _reservation = server::ocr::reserve_background().unwrap();
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = captures.clone();
+        let runner = mock_runner(move |request, _| {
+            if request.contains("/screenshot") {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Some((
+                Duration::ZERO,
+                if request.contains("/source") {
+                    json!({"value":{"type":"XCUIElementTypeApplication","label":"Owned","rect":{"x":0,"y":0,"width":390,"height":844},
+                "children":[{"type":"XCUIElementTypeButton","label":"Owned button","rect":{"x":1,"y":1,"width":100,"height":20}}]}}).to_string()
+                } else {
+                    responder(request)
+                },
+            ))
+        });
+        let state = build_state_with_runner(runner.url());
+        let request = Request::builder().method("POST").uri("/agent/actions")
+            .header("x-phone-owner","wait-fixture").header("x-phone-control","1").header("content-type","application/json")
+            .body(Body::from(json!({"observe":false,"steps":[{"kind":"wait_for","expect":{"ocr_absent":["Missing"]},"timeout_ms":200,"poll_ms":50}]}).to_string())).unwrap();
+        let response = server::http::router(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["ok"], false, "busy OCR must not prove absence: {body}");
+        assert!(body.to_string().contains("already recognizing"), "{body}");
+        let response = server::http::router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/elements?ocr=force")
+                    .header("x-phone-owner", "wait-fixture")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(
+            body.to_string().contains("already recognizing"),
+            "forced OCR did not exercise the busy lane: {body}"
+        );
+        assert_eq!(
+            captures.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "busy OCR must not capture more screenshots"
+        );
+    });
+}

@@ -11530,6 +11530,7 @@ async fn agent_ocr_read(
     deadline: tokio::time::Instant,
 ) -> Result<Vec<String>, String> {
     let read = async {
+        let reservation = crate::ocr::reserve_background().map_err(|error| format!("{error:#}"))?;
         let (width, _) = w
             .window_size()
             .await
@@ -11546,7 +11547,7 @@ async fn agent_ocr_read(
         // running to completion and warms Vision for the next read instead
         // of being killed half-way.
         let scale = f64::from(pixels) / width;
-        let rows = crate::ocr::recognize_background(png, scale)
+        let rows = crate::ocr::recognize_background(reservation, png, scale)
             .await.map_err(|error| format!("{error:#}"))?;
         Ok(rows.into_iter().map(|row| row.text).collect())
     };
@@ -20452,6 +20453,7 @@ async fn elements_ocr(
         .and_then(serde_json::Value::as_f64)
         .filter(|width| *width > 0.0)
         .ok_or("the screen size is unknown, so recognized text cannot be placed")?;
+    let reservation = crate::ocr::reserve_background().map_err(|error| format!("{error:#}"))?;
     let shot = agent_screenshot_capture(
         State(state.clone()),
         headers.clone(),
@@ -20480,7 +20482,7 @@ async fn elements_ocr(
     let scale = f64::from(pixels) / width;
     // Detached, like the OCR wait: a cold run that outlives this read still
     // finishes and warms Vision for the next one.
-    let task = crate::ocr::recognize_background(png.to_vec(), scale);
+    let task = crate::ocr::recognize_background(reservation, png.to_vec(), scale);
     let rows = tokio::time::timeout(ELEMENTS_OCR_TIMEOUT, task)
         .await
         .map_err(|_| {
