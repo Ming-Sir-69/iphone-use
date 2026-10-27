@@ -123,6 +123,11 @@
   ],
   "release_build_run": 40459158331,
   "acceptance_scope": "downloaded artifacts only; installation and device execution are separate",
-  "registry_verified": false,
-  "marketplace_verified": false
+  "registry_verified": true,
+  "marketplace_verified": true,
+  "registry_version": "0.26.1",
+  "registry_url": "https://registry.modelcontextprotocol.io/v0.1/servers/io.github.leeguooooo%2Fiphone-use/versions/0.26.1",
+  "marketplace_version": "0.26.1",
+  "marketplace_blob_sha": "b6b071ff1ac03db2441123253e9b561063d29de9",
+  "indices_verified_at": "2026-10-27T06:32:54.639032+00:00"
 }
