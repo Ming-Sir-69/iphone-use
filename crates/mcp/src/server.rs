@@ -195,6 +195,21 @@ pub struct ScreenFrameParams {
     pub fresh: Option<bool>,
 }
 
+/// Select exactly one current field without focusing it or changing the app.
+#[derive(Debug,Default,Deserialize,Serialize,JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadValueParams {
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub identifier:Option<String>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub label:Option<String>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub kind:Option<String>,
+    /// Maximum UTF-16 units returned (1–65536, default 8192); emoji may use two.
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub max_utf16:Option<u32>,
+}
+
 /// Parameters for [`phone_key`].
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1463,6 +1478,24 @@ impl PhoneHandler {
         result
     }
 
+    #[tool(
+        annotations(read_only_hint=true,open_world_hint=true),
+        description="Read one current element's AX value without tapping, focusing, waking or taking an owner lease. Give exactly one identifier or exact label from a fresh screen, optionally kind; ambiguity refuses. Use this when phone_elements marks value_truncated or the task needs full field text. Returns one bounded value in text with source/completeness metadata; complete means the AX attribute was not cut by this API, not that the app exposes its full document. A smaller max_utf16 returns truncated:true. Secure fields refuse; old runners without ipu:valueRead refuse rather than promote a preview. Owner/privacy changes withhold the value."
+    )]
+    async fn phone_read_value(&self,Parameters(params):Parameters<ReadValueParams>)->CallToolResult {
+        let body=serde_json::to_value(params).unwrap_or_else(|_|serde_json::json!({}));
+        match self.daemon.read_value(&body).await {
+            Ok(response)=>{
+                let Some(body)=response.json.as_ref().filter(|body|response.ok()&&body.get("value").is_some()) else{return daemon_read_result(&response);};
+                // One copy of the potentially long value in text; structured output is metadata only.
+                let mut metadata=body.clone();metadata.as_object_mut().unwrap().remove("value");
+                let mut result=CallToolResult::success(vec![Content::text(body.to_string())]);
+                result.structured_content=Some(metadata);result
+            }
+            Err(_)=>CallToolResult::error(vec![Content::text("value read failed; no input was sent and no preview was promoted to a complete value")]),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // phone_elements (L2)
     // -----------------------------------------------------------------------
@@ -1483,7 +1516,7 @@ impl PhoneHandler {
         block means a system alert is up: answer it with an `alert` step, taps on alerts do not act. \
         ocr=auto adds text read from pixels when the tree has no interactive rows (games, \
         canvases), ocr=force always; such rows have no element, tap their x/y with phone_tap. \
-        Requires phone_status drivable=true."
+        value_truncated marks an incomplete preview; use phone_read_value for the bounded full AX value. Requires phone_status drivable=true."
     )]
     async fn phone_elements(
         &self,
@@ -4535,7 +4568,7 @@ mod tests {
 
     /// The tools that only read: no phone input, no outward-facing writes.
     /// `IPHONE_USE_MCP_TOOLS=readonly` exposes exactly these.
-    const READ_ONLY_TOOLS: [&str; 13] = [
+    const READ_ONLY_TOOLS: [&str; 14] = [
         "phone_apps",
         "phone_capabilities",
         "phone_crashes",
@@ -4545,6 +4578,7 @@ mod tests {
         "phone_flow_list",
         "phone_home_layout",
         "phone_instances",
+        "phone_read_value",
         "phone_screen",
         "phone_screen_frame",
         "phone_screenshot",
