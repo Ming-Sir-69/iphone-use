@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Complete-value conformance on an explicitly selected owned Simulator, no phone."""
-import argparse, hashlib, importlib.util, json, os, selectors, shutil, subprocess, time, urllib.request, urllib.error, urllib.parse
+import argparse, hashlib, importlib.util, json, os, plistlib, selectors, shutil, subprocess, time, urllib.request, urllib.error, urllib.parse
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 BUNDLE='com.leeguoo.iphone-use.value-read-fixture'
@@ -53,7 +53,15 @@ def main():
     (project/'main.swift').write_bytes((ROOT/'scripts/value-read-fixture.swift').read_bytes())
     pbx=project/'GestureFixture.xcodeproj/project.pbxproj'
     pbx.write_text(pbx.read_text().replace('com.leeguoo.iphone-use.gesture-fixture',BUNDLE))
+    info=project/'Info.plist';metadata=plistlib.loads(info.read_bytes())
+    metadata.update(CFBundleIdentifier=BUNDLE,CFBundleName='Value Read Fixture',CFBundleDisplayName='Value Read Fixture')
+    metadata.pop('UIApplicationSceneManifest',None)
+    info.write_bytes(plistlib.dumps(metadata))
     drag.ROOT=fixture_root;app=drag.build_fixture(args.out)
+    built_info=plistlib.loads((app/'Info.plist').read_bytes())
+    assert built_info['CFBundleIdentifier']==BUNDLE,'built fixture identity differs; nothing installed'
+    assert 'UIApplicationSceneManifest' not in built_info,'unexpected template Scene configuration'
+
     opener=urllib.request.build_opener(urllib.request.ProxyHandler({}));installed=False;peer=None
     result={'scope':'owned Simulator-only read conformance','input_sent':False,'cases':[]};cleanup=[]
     def api(payload):
