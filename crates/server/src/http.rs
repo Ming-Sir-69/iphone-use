@@ -11546,10 +11546,8 @@ async fn agent_ocr_read(
         // running to completion and warms Vision for the next read instead
         // of being killed half-way.
         let scale = f64::from(pixels) / width;
-        let rows = tokio::spawn(async move { crate::ocr::recognize(&png, scale).await })
-            .await
-            .map_err(|error| format!("OCR task: {error}"))?
-            .map_err(|error| format!("{error:#}"))?;
+        let rows = crate::ocr::recognize_background(png, scale)
+            .await.map_err(|error| format!("{error:#}"))?;
         Ok(rows.into_iter().map(|row| row.text).collect())
     };
     tokio::time::timeout_at(deadline, read)
@@ -20482,7 +20480,7 @@ async fn elements_ocr(
     let scale = f64::from(pixels) / width;
     // Detached, like the OCR wait: a cold run that outlives this read still
     // finishes and warms Vision for the next one.
-    let task = tokio::spawn(async move { crate::ocr::recognize(&png, scale).await });
+    let task = crate::ocr::recognize_background(png.to_vec(), scale);
     let rows = tokio::time::timeout(ELEMENTS_OCR_TIMEOUT, task)
         .await
         .map_err(|_| {
@@ -20491,7 +20489,6 @@ async fn elements_ocr(
                 ELEMENTS_OCR_TIMEOUT.as_secs()
             )
         })?
-        .map_err(|error| format!("OCR task: {error}"))?
         .map_err(|error| format!("{error:#}"))?;
     Ok(crate::ocr::rows_for_elements(&rows))
 }
