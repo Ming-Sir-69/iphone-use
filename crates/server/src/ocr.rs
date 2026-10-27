@@ -65,6 +65,64 @@ pub fn set_stand_in(stand_in: Option<StandIn>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = stand_in;
 }
 
+// One background recognition per daemon. A caller timing out may leave the
+// cold worker warming Vision, but retries must not start additional helpers or
+// accumulate an unbounded queue of screenshots.
+static BACKGROUND_LANE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
+
+/// Admission held from before capture until the background recognition ends.
+pub struct RecognitionReservation {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+fn reserve_on(lane: &std::sync::Arc<tokio::sync::Semaphore>) -> Result<RecognitionReservation> {
+    let permit = lane.clone().try_acquire_owned()
+        .map_err(|_| anyhow::anyhow!("OCR is already recognizing a screen; retry a fresh read after the current run finishes"))?;
+    Ok(RecognitionReservation { _permit: permit })
+}
+
+/// Refuse busy OCR before asking the phone for another screenshot.
+pub fn reserve_background() -> Result<RecognitionReservation> {
+    let lane = BACKGROUND_LANE.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
+    reserve_on(lane)
+}
+
+async fn run_reserved<F, T>(reservation: RecognitionReservation, work: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(async move {
+        let _reservation = reservation;
+        work.await
+    })
+    .await
+    .context("OCR background task")?
+}
+
+#[cfg(test)]
+async fn bounded_background<F, T>(
+    lane: &std::sync::Arc<tokio::sync::Semaphore>,
+    work: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    run_reserved(reserve_on(lane)?, work).await
+}
+
+/// Keep an admitted cold recognition alive after its caller's read deadline.
+/// There is no result cache: every admitted call recognizes its own screenshot.
+pub async fn recognize_background(
+    reservation: RecognitionReservation,
+    png: Vec<u8>,
+    scale: f64,
+) -> Result<Vec<OcrRow>> {
+    run_reserved(reservation, async move { recognize(&png, scale).await }).await
+}
+
 /// Recognize the text in a PNG screenshot. `scale` is pixels per point (the
 /// screenshot's width over the screen's width in points, e.g. 3.0).
 pub async fn recognize(png: &[u8], scale: f64) -> Result<Vec<OcrRow>> {
@@ -453,5 +511,94 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("needs macOS"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod background_tests {
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[test]
+    fn cancelled_caller_keeps_one_worker_without_queuing_retries_or_reusing_its_text() {
+        block_on(async {
+            let lane = Arc::new(tokio::sync::Semaphore::new(1));
+            let started = Arc::new(tokio::sync::Notify::new());
+            let finish = Arc::new(tokio::sync::Notify::new());
+            let signal = started.clone();
+            let release = finish.clone();
+            let worker_lane = lane.clone();
+            let caller = tokio::spawn(async move {
+                bounded_background(&worker_lane, async move {
+                    signal.notify_one();
+                    release.notified().await;
+                    Ok("old screenshot text")
+                })
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(2), started.notified())
+                .await
+                .unwrap();
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+            let extra = Arc::new(AtomicUsize::new(0));
+            for _ in 0..8 {
+                let hits = extra.clone();
+                let rejected = bounded_background(&lane, async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Ok("unexpected screenshot text")
+                })
+                .await;
+                assert!(rejected
+                    .unwrap_err()
+                    .to_string()
+                    .contains("already recognizing"));
+            }
+            assert_eq!(extra.load(Ordering::SeqCst), 0);
+            finish.notify_one();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while lane.available_permits() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let fresh = bounded_background(&lane, async { Ok("fresh screenshot text") })
+                .await
+                .unwrap();
+            assert_eq!(fresh, "fresh screenshot text");
+            assert_eq!(
+                extra.load(Ordering::SeqCst),
+                0,
+                "refused retries must never run later"
+            );
+        });
+    }
+
+    #[test]
+    fn recognition_errors_and_worker_panics_release_the_lane() {
+        block_on(async {
+            let lane = Arc::new(tokio::sync::Semaphore::new(1));
+            let failed: Result<()> =
+                bounded_background(&lane, async { anyhow::bail!("synthetic failure") }).await;
+            assert!(failed.is_err());
+            let panicked: Result<()> =
+                bounded_background(&lane, async { panic!("owned worker fault") }).await;
+            assert!(panicked
+                .unwrap_err()
+                .to_string()
+                .contains("background task"));
+            assert_eq!(bounded_background(&lane, async { Ok(7) }).await.unwrap(), 7);
+        });
     }
 }
