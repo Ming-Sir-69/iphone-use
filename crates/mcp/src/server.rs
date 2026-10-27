@@ -1450,7 +1450,7 @@ impl PhoneHandler {
         // A response body can be revoked after its 200 headers, surfacing as
         // a transport error. Any failed capture must clear the previous pixels;
         // a concurrent status response cannot authorize reusing them.
-        let clear_frame = frame.is_err();
+        let clear_frame = !matches!(&frame, Ok(bytes) if !bytes.is_empty());
         let mut result = crate::screen::frame_result(
             status
                 .map(|s| crate::screen::status_summary(&s, self.daemon.owner()))

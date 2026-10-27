@@ -519,8 +519,8 @@ fn capabilities_reach_the_client_as_structured_content() {
 
 #[test]
 fn failed_capture_clears_old_pixels_despite_racing_open_status() {
-    for status in ["423 Locked", "503 Service Unavailable", "200 Truncated"] {
-        let daemon = ScriptedDaemon::routed(status, br#"{"ok":false,"error":"capture_refused"}"#.to_vec(),
+    for status in ["423 Locked", "503 Service Unavailable", "200 Truncated", "200 Empty"] {
+        let daemon = ScriptedDaemon::routed(status, if status == "200 Empty" {Vec::new()} else {br#"{"ok":false,"error":"capture_refused"}"#.to_vec()},
             Some(br#"{"ok":true,"drivable":true,"screen_private_secs":0}"#.to_vec()));
         let mut child = McpChild::start_with(&daemon.url, "off");
         let reply = child.call_tool(2, "phone_screen_frame", serde_json::json!({}));

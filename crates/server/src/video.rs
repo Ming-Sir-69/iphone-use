@@ -761,7 +761,8 @@ impl VideoHub {
                 // The encoder could not start (or died): stop, so the next
                 // subscriber starts a fresh pipeline instead of feeding a
                 // thread that is gone.
-                self.mark_stopped();
+                // `run` owns the error transition. Clearing here as well
+                // could let a new producer start before `run` clears it again.
                 anyhow::bail!("the H.264 encoder stopped");
             }
             // A relay that accepts the connection but never answers must not
