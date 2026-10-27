@@ -600,7 +600,7 @@ fn full_value_is_single_copy_and_never_requests_control_in_all_output_modes() {
         let text = result["content"][0]["text"].as_str().unwrap();
         assert_eq!(serde_json::from_str::<serde_json::Value>(text).unwrap()["value"],value);
         assert_eq!(reply.to_string().matches(&value).count(),1);
-        assert!(result["structuredContent"].get("value").is_none());
+        assert!(result.get("structuredContent").is_none() || result["structuredContent"].is_null(), "a metadata-only structured result hides the text in some hosts: {reply}");
         let requests = daemon.requests.lock().unwrap();
         assert_eq!(requests.len(),1);
         assert!(requests[0].starts_with("POST /agent/value "));

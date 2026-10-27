@@ -101,7 +101,7 @@ def main():
             status,bounded=api({'identifier':'emoji-field','max_utf16':limit})
             assert status==200 and bounded['value']==wanted and bounded['truncated'] is True and not bounded['complete']
             result['cases'].append({'case':'scalar-boundary','limit_utf16':limit,'passed':True})
-        status,quoted=api({'label':"Quote ' \\ 100%@ field"});assert status==200 and quoted['value']=='quoted-value'
+        status,quoted=api({'label':"Quote ' \\ 100%@ field\nsecond\tline"});assert status==200 and quoted['value']=='quoted-value'
         status,secure=api({'identifier':'secure-field'});assert status==403 and 'value' not in secure and 'OWNED_SYNTHETIC_SECRET' not in json.dumps(secure)
         status,ambiguous=api({'label':'Duplicate'});assert status==422 and ambiguous['error']=='ambiguous_element' and 'value' not in ambiguous
         status,missing=api({'identifier':'not-present'});assert status==422 and missing['error']=='element_not_found'

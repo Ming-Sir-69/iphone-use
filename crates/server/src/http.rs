@@ -12497,9 +12497,6 @@ async fn scoped_value_read<T>(state: &AppState, scope: &ValueReadScope, work: im
     }
 }
 
-fn value_predicate_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
-}
 #[derive(Clone)]
 struct ValueReadFence {
     state: Arc<AppState>,
@@ -12552,10 +12549,10 @@ async fn agent_value(
     };
     let selector = match (request.identifier.as_deref(), request.label.as_deref()) {
         (Some(id), None) if !id.is_empty() && id.chars().count() <= 512 => {
-            format!("identifier == {}", value_predicate_literal(id))
+            format!("identifier == {}", runner_predicate_literal(id))
         }
         (None, Some(label)) if !label.is_empty() && label.chars().count() <= 512 => {
-            format!("label == {}", value_predicate_literal(label))
+            format!("label == {}", runner_predicate_literal(label))
         }
         _ => {
             return invalid_list_request(
@@ -12577,7 +12574,7 @@ async fn agent_value(
         }
         format!(
             "({selector}) AND type == {}",
-            value_predicate_literal(&format!(
+            runner_predicate_literal(&format!(
                 "XCUIElementType{}",
                 kind.trim_start_matches("XCUIElementType")
             ))
@@ -12632,6 +12629,11 @@ async fn agent_value(
                     serde_json::json!({"ok":false,"error":"secure_value_read_requires_human"}),
                 )
             }
+            Ok(None) => json_response(StatusCode::CONFLICT, value_scope_failure()),
+            Ok(Some(Err(ref error))) if !crate::runner::runner_http_error(error).is_some_and(|e|
+                e.status.as_u16() == 501 || matches!(e.code.as_deref(), Some("unknown command" | "unsupported operation"))) =>
+                json_response(StatusCode::BAD_GATEWAY,
+                    serde_json::json!({"ok":false,"error":"value_read_failed","retry_safe":true})),
             _ => json_response(
                 StatusCode::NOT_IMPLEMENTED,
                 serde_json::json!({"ok":false,"error":"full_value_unavailable","hint":"The runner did not supply a complete-value contract; upgrade it or use a permitted alternative read. No preview was promoted to a full value"}),

@@ -29,7 +29,7 @@ final class ValueController: UIViewController, UITextViewDelegate {
       fields.append(field); stack.addArrangedSubview(field)
     }
     field("emoji-field", "🙂abc")
-    field("quoted-field", "quoted-value", label: "Quote ' \\ 100%@ field")
+    field("quoted-field", "quoted-value", label: "Quote ' \\ 100%@ field\nsecond\tline")
     field("secure-field", "OWNED_SYNTHETIC_SECRET", secure: true)
     field("duplicate-a", "one", label: "Duplicate")
     field("duplicate-b", "two", label: "Duplicate")

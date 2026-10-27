@@ -315,3 +315,18 @@ fn explicit_secure_kind_is_refused_without_a_runner_request() {
         assert!(body.get("value").is_none());
     });
 }
+
+#[test]
+fn transient_native_failure_is_retryable_instead_of_claiming_unsupported() {
+    block(async {
+        let runner = mock_runner(|r, _| {
+            if r.starts_with("GET ") && r.contains("/element/E0/value") { return None; }
+            Some((Duration::ZERO, base(r, 1, true)))
+        });
+        let (status, body) = decode(response(build_state_with_runner(runner.url()), json!({"identifier":"a"})).await).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["error"], "value_read_failed");
+        assert_eq!(body["retry_safe"], true);
+        assert!(body.get("value").is_none());
+    });
+}

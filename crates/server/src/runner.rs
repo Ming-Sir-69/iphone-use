@@ -957,7 +957,12 @@ impl RunnerClient {
     /// their bounded snapshot string is never promoted to a complete value.
     pub async fn read_element_value(&mut self, id: &str, max_utf16: u32) -> Result<serde_json::Value> {
         let sid=self.ensure_session().await?.to_string();
-        if !self.value_read {anyhow::bail!("runner lacks ipu:valueRead");}
+        if !self.value_read {
+            return Err(RunnerHttpError {
+                operation: "GET element value".into(), status: reqwest::StatusCode::NOT_IMPLEMENTED,
+                code: Some("unsupported operation".into()), message: Some("runner lacks ipu:valueRead".into()),
+            }.into());
+        }
         let response=self.http.get(format!("{}/session/{}/element/{}/value?complete=1",self.base,sid,id))
             .query(&[("max_utf16",max_utf16)]).send_signed(&self.auth).await?;
         ensure_runner_success(response,"GET element value").await

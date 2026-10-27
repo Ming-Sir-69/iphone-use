@@ -1489,11 +1489,10 @@ impl PhoneHandler {
             Ok(response) => {
                 if let Some(body) = response.json.as_ref().filter(|body| response.ok() && body["ok"] == true
                     && iu_core::value_read::valid_contract(body, limit)) {
-                    let mut metadata = body.clone();
-                    metadata.as_object_mut().unwrap().remove("value");
-                    let mut result = CallToolResult::success(vec![Content::text(body.to_string())]);
-                    result.structured_content = Some(metadata);
-                    return result;
+                    // Hosts may show only structuredContent when it exists.
+                    // A content-only result keeps the full value visible once
+                    // in every output mode, without a competing metadata copy.
+                    return CallToolResult::success(vec![Content::text(body.to_string())]);
                 }
                 if let Some(body) = response.json.as_ref().filter(|body| body["ok"] == false) {
                     let mut safe = body.clone();
