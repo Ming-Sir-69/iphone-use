@@ -169,7 +169,7 @@
       <h3>收窄工具、走 HTTP、选手机</h3>
       <ul>
         <li><code>IPHONE_USE_MCP_TOOLS=readonly</code> 只开放读取类工具；写一个逗号分隔的列表则只开放列出的工具。</li>
-        <li><code>iphone-use-mcp --listen 127.0.0.1:端口</code> 可以通过 HTTP 提供 MCP。监听 127.0.0.1 时只有本机能连；其他机器上的客户端要通过带认证的隧道访问，或者监听其他地址并设置 <code>IPHONE_USE_MCP_TOKEN</code>（非回环地址必须设置）。</li>
+        <li><code>iphone-use-mcp --listen 127.0.0.1:端口</code> 可以通过 HTTP 提供 MCP。监听 127.0.0.1 时只有本机能连；其他机器上的客户端应通过带认证的加密隧道访问。若监听非回环地址，必须设置 <code>IPHONE_USE_MCP_TOKEN</code>，并使用 TLS 反向代理或可信的加密隧道保护传输；明文 HTTP 会暴露 bearer 令牌。</li>
         <li>装了多台手机时，<code>phone_instances</code> 只读列出实例，不重连；每次调用都可以用 <code>instance:"i13"</code> 选一台。省略参数仍使用启动时配置的守护进程，实例缺失时直接报错，不改选其他手机。</li>
         <li>手边没有手机？<code>iphone-use simulator start "iPhone 16 Pro"</code>，再用 <code>claude mcp add iphone-sim -e IPHONE_USE_INSTANCE=sim -- iphone-use-mcp</code> 接上（预览功能，需要 Xcode）。</li>
       </ul>

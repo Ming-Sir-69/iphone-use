@@ -169,7 +169,7 @@
       <h3>Narrow it, serve it, pick a phone</h3>
       <ul>
         <li><code>IPHONE_USE_MCP_TOOLS=readonly</code> exposes only the tools that read; a comma list names exactly the tools to expose.</li>
-        <li><code>iphone-use-mcp --listen 127.0.0.1:PORT</code> serves MCP over HTTP. A loopback listener is reachable only from the same Mac; for a client on another machine use an authenticated tunnel, or listen on another address with <code>IPHONE_USE_MCP_TOKEN</code> set (required off loopback).</li>
+        <li><code>iphone-use-mcp --listen 127.0.0.1:PORT</code> serves MCP over HTTP. A loopback listener is reachable only from the same Mac; for a client on another machine use an authenticated encrypted tunnel. A non-loopback listener requires <code>IPHONE_USE_MCP_TOKEN</code> and transport protection through a TLS reverse proxy or trusted encrypted tunnel; plain HTTP exposes the bearer token.</li>
         <li>With several phones installed, <code>phone_instances</code> lists them without reconnecting, and any call can pick one with <code>instance:"i13"</code>. Omit it to keep the configured daemon; a missing instance fails without selecting a different phone.</li>
         <li>No phone at hand? <code>iphone-use simulator start "iPhone 16 Pro"</code>, then <code>claude mcp add iphone-sim -e IPHONE_USE_INSTANCE=sim -- iphone-use-mcp</code> (preview, needs Xcode).</li>
       </ul>

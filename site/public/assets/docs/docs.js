@@ -7,6 +7,8 @@
    No ads, no account chip, no PostHog on this site.
    ========================================================================== */
 (function () {
+  // Preview builds must not count as production visits.
+  if (location.hostname.toLowerCase() !== 'iphone-use.leeguoo.com') return;
   var head = document.head || document.getElementsByTagName('head')[0];
   if (!head) return;
 
@@ -433,7 +435,9 @@
       var btn = el("button", "du-code-copy", lng === "en" ? "Copy" : "复制");
       btn.addEventListener("click", function () {
         var pre = block.querySelector("pre");
-        copyText(pre ? pre.innerText : "", btn, lng === "en" ? "Copied" : "已复制", false);
+        var code = pre ? pre.cloneNode(true) : null;
+        if (code) code.querySelectorAll(".du-prompt").forEach(function (prompt) { prompt.remove(); });
+        copyText(code ? code.textContent : "", btn, lng === "en" ? "Copied" : "已复制", false);
       });
       head.appendChild(btn);
     });

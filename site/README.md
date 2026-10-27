@@ -52,7 +52,8 @@ links, invalid JSON-LD, and a `robots.txt` without the sitemap. `softwareVersion
 `public/assets/og.png` is `_tools/og.html` rendered at 1200×630:
 
 ```bash
-cd site && python3 -m http.server 8811 --bind 127.0.0.1 &
+cd site
+python3 -m http.server 8811 --bind 127.0.0.1 &
 chrome-use --session og open http://127.0.0.1:8811/_tools/og.html
 chrome-use --session og set viewport 1200 630
 chrome-use --session og screenshot public/assets/og.png
@@ -73,6 +74,7 @@ to `install.html`.
 From `site/`:
 
 ```bash
+python3 _tools/seo.py --check && \
 WA_PASSTHROUGH=1 CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=3d050f54dac3fb90c344e3889ec45792 npx wrangler@4 deploy
 ```
 

@@ -81,7 +81,7 @@
       <h2>The daemon</h2>
       <p>The daemon runs as a per-user LaunchAgent and listens on <code>127.0.0.1:44321</code> behind a password. It offers the same control in three forms: an MCP server for agents, an HTTP API under <code>/agent/*</code> for scripts, and a web page plus a native iOS app for people (<a href="/en/connect">Connect</a>).</p>
       <ul>
-        <li><strong>The screen as text.</strong> <code>/agent/elements</code> returns a flattened accessibility tree with a snapshot token; element taps are bound to that snapshot, so a changed screen fails with <code>stale_element_snapshot</code> instead of tapping the wrong thing.</li>
+        <li><strong>The screen as text.</strong> <code>/agent/elements</code> returns a flattened accessibility tree with a snapshot token; element taps recheck the target before dispatch and refuse an invalid snapshot with <code>stale_element_snapshot</code>.</li>
         <li><strong>Honest outcomes.</strong> Every action reports whether it was applied, not sent, or unknown, and whether a retry is safe. A tap on an element covered by another control is refused (<code>element_occluded</code>).</li>
         <li><strong>Settle check.</strong> After an action the daemon can read the tree again and return what changed plus a <code>settle</code> block (<code>stable</code>, <code>budget_exhausted</code> or <code>observation_failed</code>).</li>
         <li><strong>The Mac stays still.</strong> It never touches the Mac's screen, cursor or focus.</li>
@@ -145,7 +145,7 @@
       <p>The daemon on the phone is the same program as on the Mac, linked into the runner. With a <strong>paid</strong> developer team, the iOS app's packet-tunnel extension starts the runner on the phone itself, so the phone serves taps, typing, screen reads and the agent API with no Mac at run time (iOS 17.4 or later; the first pairing still needs the USB cable once). A free Apple ID gets the remote app, which drives phones that a Mac serves. Goals handed to the daemon as <a href="/en/tasks">agent tasks</a> keep running there while another app is in front.</p>
 
       <h2>More than one phone</h2>
-      <p>One daemon drives one phone. A <strong>named instance</strong> (<code>./install.sh --instance lab --udid &lt;UDID&gt;</code>) gets its own copy of the app, state directory, launchd labels, token and ports, and leaves the default install alone. Each phone has its own daemon and runner, so two phones driven at the same time run as fast as either one alone. MCP calls can pick an installed instance per call with <code>instance</code>.</p>
+      <p>One daemon drives one phone. A <strong>named instance</strong> (<code>./install.sh --instance lab --udid &lt;UDID&gt;</code>) gets its own copy of the app, state directory, launchd labels, token and ports, and leaves the default install alone. Each phone has its own daemon and runner. Concurrent speed still depends on Mac load, connections and phone state. MCP calls can pick an installed instance per call with <code>instance</code>.</p>
 
       <h2>Simulators (preview)</h2>
       <p>The runner also runs on an iOS Simulator, with no phone, Apple ID or signing: <code>iphone-use simulator start "iPhone 16 Pro"</code> builds and starts everything, then <code>IPHONE_USE_INSTANCE=sim</code> points an MCP client at it. Simulators have no camera, App Store apps, real push notifications or Face ID, so tasks that need those only work on a phone.</p>

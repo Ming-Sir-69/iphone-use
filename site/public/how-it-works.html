@@ -79,7 +79,7 @@
       <h2>守护进程</h2>
       <p>守护进程以当前用户的 LaunchAgent 运行，监听 <code>127.0.0.1:44321</code> 并要求密码。它用三种形式提供同样的控制：给 agent 的 MCP server、给脚本的 <code>/agent/*</code> HTTP 接口，以及给人用的网页和 iOS 原生 App（见<a href="/connect">接入方式</a>）。</p>
       <ul>
-        <li><strong>屏幕读成文字。</strong><code>/agent/elements</code> 返回展平的无障碍树和一个快照令牌；按元素点击绑定在这个快照上，画面变了就返回 <code>stale_element_snapshot</code>，不会点错。</li>
+        <li><strong>屏幕读成文字。</strong><code>/agent/elements</code> 返回展平的无障碍树和一个快照令牌；按元素点击前会重新核对目标；目标失效时返回 <code>stale_element_snapshot</code>，拒绝使用旧快照。</li>
         <li><strong>结果说实话。</strong>每个操作都说明是已执行、没发出去还是结果不确定，以及能不能安全重试。点到被其他控件遮住的元素会直接拒绝（<code>element_occluded</code>）。</li>
         <li><strong>等画面稳定。</strong>动作之后守护进程可以再读一次树，返回变化和一个 <code>settle</code> 块（<code>stable</code>、<code>budget_exhausted</code> 或 <code>observation_failed</code>）。</li>
         <li><strong>不动 Mac。</strong>不碰 Mac 的屏幕、光标和窗口焦点。</li>
@@ -142,7 +142,7 @@
       <p>手机上的守护进程和 Mac 上是同一个程序，链接进了 runner。有<strong>付费</strong>开发者团队时，iOS App 里的 packet-tunnel 扩展会在手机本身上启动 runner，手机自己就能提供点击、输入、读屏和 agent 接口，运行时不需要 Mac（iOS 17.4 及以上；第一次配对仍需插一次 USB 线）。免费 Apple ID 得到的是远程 App，用来操作由 Mac 托管的手机。交给守护进程的 <a href="/tasks">agent 任务</a>在其他 App 处于前台时也会继续运行。</p>
 
       <h2>不止一台手机</h2>
-      <p>一个守护进程操作一台手机。<strong>命名实例</strong>（<code>./install.sh --instance lab --udid &lt;UDID&gt;</code>）有自己的一份 App、状态目录、launchd 标签、令牌和端口，不动默认安装。每台手机有独立的守护进程和 runner，两台同时操作时，每台都和单独操作一样快。MCP 调用可以用 <code>instance</code> 参数逐次选择已安装的实例。</p>
+      <p>一个守护进程操作一台手机。<strong>命名实例</strong>（<code>./install.sh --instance lab --udid &lt;UDID&gt;</code>）有自己的一份 App、状态目录、launchd 标签、令牌和端口，不动默认安装。每台手机有独立的守护进程和 runner；并发速度仍取决于 Mac 负载、连接和手机状态。MCP 调用可以用 <code>instance</code> 参数逐次选择已安装的实例。</p>
 
       <h2>模拟器（预览）</h2>
       <p>runner 也能跑在 iOS 模拟器上，不需要手机、Apple ID 或签名：<code>iphone-use simulator start "iPhone 16 Pro"</code> 会编译并启动所需的一切，然后用 <code>IPHONE_USE_INSTANCE=sim</code> 把 MCP 客户端接上去。模拟器没有相机、App Store 应用、真实推送和 Face ID，需要这些的任务只能在真机上做。</p>

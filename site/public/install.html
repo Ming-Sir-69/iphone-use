@@ -66,7 +66,7 @@
       <h2>需要准备</h2>
       <ul>
         <li><strong>一台 macOS 15 以上的 Mac</strong>，装好完整的 <strong>Xcode.app</strong>（只有命令行工具不够），在 Xcode → 设置 → Accounts 里登录 Apple ID 并选好开发团队。免费的 Personal Team 可以用，但它的 runner 描述文件需要定期续签。也可以用 App Store Connect API key（<code>IPU_RUNNER_ASC_KEY_PATH</code>、<code>IPU_RUNNER_ASC_KEY_ID</code>、<code>IPU_RUNNER_ASC_ISSUER_ID</code>）签名，不用 Xcode 账号。</li>
-        <li><strong>一台 iOS 15 及以上的 iPhone</strong>，打开开发者模式（设置 → 隐私与安全性 → 开发者模式），并通过 USB 和这台 Mac 配对、信任。</li>
+        <li><strong>一台 iOS 15 及以上的 iPhone</strong>；iOS 16 及以上需要打开开发者模式（设置 → 隐私与安全性 → 开发者模式），并通过 USB 和这台 Mac 配对、信任。</li>
         <li><strong>第一次配置需要一根数据线。</strong>安装前把 iPhone 插上并解锁。构建、启动和使用 runner 时手机要保持解锁和亮屏；Face ID 和锁屏密码它过不去。</li>
         <li>不需要 Homebrew 包。只有从源码构建时才需要 Rust 工具链。</li>
       </ul>
