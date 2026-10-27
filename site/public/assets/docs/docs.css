@@ -626,3 +626,9 @@ img { max-width: 100%; }
 /* comparison tables: first column reads as a label */
 .du-main table.du-compare td:first-child { font-weight: 600; white-space: nowrap; }
 .du-main .du-asof { font: 12.5px var(--font-mono); color: var(--ink-faint); }
+
+/* ============================================================ TABLES ==== */
+.du-main table { width: 100%; border-collapse: collapse; font-size: .92rem; margin: 14px 0 20px; }
+.du-main th, .du-main td { border: 1px solid var(--line); padding: 8px 11px; text-align: left; vertical-align: top; }
+.du-main thead th { background: var(--paper-2); font-weight: 700; }
+.du-main table.du-compare tbody tr:first-child td, .du-main table.du-compare tbody tr:first-child th { background: color-mix(in srgb, var(--green) 8%, transparent); }
