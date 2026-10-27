@@ -12456,11 +12456,31 @@ async fn agent_actions_inner(
     agent_actions_json(StatusCode::OK, result)
 }
 
-#[derive(Clone, Copy)]
-struct ValueReadScope { epoch: u64, privacy_epoch: u64 }
+#[derive(Clone)]
+struct ValueReadScope { epoch: u64, privacy_epoch: u64, owner: Option<String> }
 impl ValueReadScope {
+    fn capture(state: &AppState) -> Self {
+        let owner = recover(state.owner.lock());
+        let now = Instant::now();
+        let lease = std::time::Duration::from_secs(state.owner_lease_secs);
+        Self {
+            epoch: state.owner_epoch.load(std::sync::atomic::Ordering::Acquire),
+            privacy_epoch: state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire),
+            owner: owner.as_ref().filter(|owner| now.saturating_duration_since(owner.last_seen) < lease)
+                .map(|owner| owner.name.clone()),
+        }
+    }
     fn current(&self, state: &AppState) -> bool {
-        self.epoch == state.owner_epoch.load(std::sync::atomic::Ordering::Acquire)
+        let owner_matches = {
+            let owner = recover(state.owner.lock());
+            let now = Instant::now();
+            let lease = std::time::Duration::from_secs(state.owner_lease_secs);
+            self.epoch == state.owner_epoch.load(std::sync::atomic::Ordering::Acquire)
+                && self.owner.as_deref() == owner.as_ref()
+                    .filter(|owner| now.saturating_duration_since(owner.last_seen) < lease)
+                    .map(|owner| owner.name.as_str())
+        };
+        owner_matches
             && self.privacy_epoch == state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire)
             && !screen_private_now(&state.private_until)
             && !state.released.load(std::sync::atomic::Ordering::Acquire)
@@ -12496,39 +12516,12 @@ struct ValueReadRequest {
     kind: Option<String>,
     max_utf16: Option<u32>,
 }
-fn valid_value_contract(value: &serde_json::Value, limit: u32) -> bool {
-    let Some(text) = value.get("value") else {
-        return false;
-    };
-    if !text.is_null() && !text.is_string() {
-        return false;
-    }
-    let returned = text.as_str().map_or(0, |v| v.encode_utf16().count()) as u64;
-    let Some(total) = value
-        .get("utf16_length")
-        .and_then(serde_json::Value::as_u64)
-    else {
-        return false;
-    };
-    returned <= limit as u64
-        && total >= returned
-        && value["source"] == "ax_value_attribute"
-        && value["limit_utf16"] == limit
-        && value["returned_utf16_length"] == returned
-        && value["complete"] == (returned == total)
-        && value["truncated"] == (returned < total)
-}
 async fn agent_value(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    let scope = ValueReadScope {
-        epoch: state.owner_epoch.load(std::sync::atomic::Ordering::Acquire),
-        privacy_epoch: state
-            .privacy_epoch
-            .load(std::sync::atomic::Ordering::Acquire),
-    };
+    let scope = ValueReadScope::capture(&state);
     match agent_auth(&state, &headers) {
         AgentAuth::Ok => {}
         AgentAuth::Denied => {
@@ -12578,6 +12571,10 @@ async fn agent_value(
         if kind.is_empty() || kind.len() > 80 {
             return invalid_list_request("invalid kind".into());
         }
+        if kind.trim_start_matches("XCUIElementType") == "SecureTextField" {
+            return json_response(StatusCode::FORBIDDEN,
+                serde_json::json!({"ok":false,"error":"secure_value_read_requires_human"}));
+        }
         format!(
             "({selector}) AND type == {}",
             value_predicate_literal(&format!(
@@ -12611,7 +12608,7 @@ async fn agent_value(
         json_response(StatusCode::CONFLICT, value_scope_failure())
     } else {
         match outcome {
-            Ok(Some(Ok(Ok(mut value)))) if valid_value_contract(&value, limit) => {
+            Ok(Some(Ok(Ok(mut value)))) if core::value_read::valid_contract(&value, limit) => {
                 value["ok"] = true.into();
                 json_response(StatusCode::OK, value)
             }

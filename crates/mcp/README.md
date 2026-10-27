@@ -517,3 +517,7 @@ Local daemon calls bypass process/system HTTP proxies. Automatic credentials
 are loaded only for a parsed loopback URL matching the selected LaunchAgent's
 port and without URL userinfo. An explicit remote URL/token keeps its configured
 transport; a different local port requires its own explicit credentials.
+
+`phone_read_value` reads one exact identifier/label as a bounded full AX value,
+without focusing the field or claiming a lease. Completeness is explicit; secure
+fields and unsupported Runners refuse. The value appears once in tool text.

@@ -77,6 +77,9 @@ jobs:
           rustup toolchain install 1.96.0 --profile minimal --component clippy
           cargo +1.96.0 clippy --workspace --locked -- -D warnings
 
+      - name: Shared protocol tests
+        run: cargo test -p core --locked
+
       - name: cargo test -p server
         timeout-minutes: 15
         shell: bash

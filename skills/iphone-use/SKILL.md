@@ -260,3 +260,10 @@ instance falls back to another phone. Do not read tokens or hand-write HTTP just
 to switch instances. Discovery never reconnects; ordinary ownership, privacy,
 lock and phone-ended/human-handoff rules still apply. Runtime selection supports
 installed local LaunchAgents; simulator-only records remain separate.
+
+
+When a task needs the complete value of one non-secure field, use
+`phone_read_value` with its fresh identifier or exact label. Check the returned
+completeness and UTF-16 limit. A truncated preview is not a full value; secure or
+unsupported fields require a permitted alternative. Ownership/privacy changes
+withhold results. This read does not focus, unlock, or claim control.

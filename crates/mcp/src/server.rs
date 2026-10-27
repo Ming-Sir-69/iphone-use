@@ -1482,17 +1482,29 @@ impl PhoneHandler {
         annotations(read_only_hint=true,open_world_hint=true),
         description="Read one current element's AX value without tapping, focusing, waking or taking an owner lease. Give exactly one identifier or exact label from a fresh screen, optionally kind; ambiguity refuses. Use this when phone_elements marks value_truncated or the task needs full field text. Returns one bounded value in text with source/completeness metadata; complete means the AX attribute was not cut by this API, not that the app exposes its full document. A smaller max_utf16 returns truncated:true. Secure fields refuse; old runners without ipu:valueRead refuse rather than promote a preview. Owner/privacy changes withhold the value."
     )]
-    async fn phone_read_value(&self,Parameters(params):Parameters<ReadValueParams>)->CallToolResult {
-        let body=serde_json::to_value(params).unwrap_or_else(|_|serde_json::json!({}));
-        match self.daemon.read_value(&body).await {
-            Ok(response)=>{
-                let Some(body)=response.json.as_ref().filter(|body|response.ok()&&body.get("value").is_some()) else{return daemon_read_result(&response);};
-                // One copy of the potentially long value in text; structured output is metadata only.
-                let mut metadata=body.clone();metadata.as_object_mut().unwrap().remove("value");
-                let mut result=CallToolResult::success(vec![Content::text(body.to_string())]);
-                result.structured_content=Some(metadata);result
+    async fn phone_read_value(&self, Parameters(params): Parameters<ReadValueParams>) -> CallToolResult {
+        let limit = params.max_utf16.unwrap_or(8192);
+        let request = serde_json::to_value(params).unwrap_or_else(|_| serde_json::json!({}));
+        match self.daemon.read_value(&request).await {
+            Ok(response) => {
+                if let Some(body) = response.json.as_ref().filter(|body| response.ok() && body["ok"] == true
+                    && iu_core::value_read::valid_contract(body, limit)) {
+                    let mut metadata = body.clone();
+                    metadata.as_object_mut().unwrap().remove("value");
+                    let mut result = CallToolResult::success(vec![Content::text(body.to_string())]);
+                    result.structured_content = Some(metadata);
+                    return result;
+                }
+                if let Some(body) = response.json.as_ref().filter(|body| body["ok"] == false) {
+                    let mut safe = body.clone();
+                    if let Some(object) = safe.as_object_mut() { object.remove("value"); }
+                    let mut result = CallToolResult::error(vec![Content::text(safe.to_string())]);
+                    result.structured_content = Some(safe);
+                    return result;
+                }
+                CallToolResult::error(vec![Content::text("full value contract unavailable; no preview was promoted to a complete value")])
             }
-            Err(_)=>CallToolResult::error(vec![Content::text("value read failed; no input was sent and no preview was promoted to a complete value")]),
+            Err(_) => CallToolResult::error(vec![Content::text("value read failed; no input was sent and no preview was promoted to a complete value")]),
         }
     }
 

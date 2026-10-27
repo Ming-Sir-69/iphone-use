@@ -202,3 +202,116 @@ fn a_queued_value_body_rechecks_scope_before_publication() {
         assert_eq!(body["value_omitted"], true);
     });
 }
+
+async fn public_hold(state: Arc<server::http::AppState>, name: Option<&str>) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/agent/hold")
+        .header("x-phone-control", "1")
+        .header("content-type", "application/json");
+    if let Some(name) = name {
+        request = request.header("x-phone-owner", name);
+    }
+    let response = server::http::router(state)
+        .oneshot(
+            request
+                .body(Body::from(json!({"secs":0,"private":false}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+async fn release_owner(state: Arc<server::http::AppState>, name: &str) {
+    let response = server::http::router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/agent/owner")
+                .header("x-phone-control", "1")
+                .header("x-phone-owner", name)
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"release":true}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+#[test]
+fn queued_value_survives_renewal_but_not_owner_aba() {
+    block(async {
+        for aba in [false, true] {
+            let runner = mock_runner(|r, _| {
+                Some((
+                    Duration::ZERO,
+                    if r.contains("/element/E0/value") {
+                        json!({"value":contract(8192)}).to_string()
+                    } else {
+                        base(r, 1, true)
+                    },
+                ))
+            });
+            let state = build_state_with_runner(runner.url());
+            public_hold(state.clone(), Some("owner-a")).await;
+            let reply = response(state.clone(), json!({"identifier":"field-a"})).await;
+            assert_eq!(reply.status(), StatusCode::OK);
+            if aba {
+                release_owner(state.clone(), "owner-a").await;
+                public_hold(state.clone(), Some("owner-b")).await;
+                release_owner(state.clone(), "owner-b").await;
+            }
+            public_hold(state.clone(), Some("owner-a")).await;
+            let (_, body) = decode(reply).await;
+            if aba {
+                assert_eq!(body["value_omitted"], true);
+                assert!(body.get("value").is_none());
+            } else {
+                assert_eq!(body["value"], contract(8192)["value"]);
+            }
+        }
+    });
+}
+#[test]
+fn expiry_withholds_old_value_but_expired_owner_cleanup_preserves_new_read() {
+    block(async {
+        let runner = mock_runner(|r, _| {
+            Some((
+                Duration::ZERO,
+                if r.contains("/element/E0/value") {
+                    json!({"value":contract(8192)}).to_string()
+                } else {
+                    base(r, 1, true)
+                },
+            ))
+        });
+        let state = build_state_with_runner(runner.url());
+        public_hold(state.clone(), Some("owner-a")).await;
+        let old = response(state.clone(), json!({"identifier":"field-a"})).await;
+        state.owner.lock().unwrap().as_mut().unwrap().last_seen =
+            std::time::Instant::now() - Duration::from_secs(state.owner_lease_secs + 1);
+        let (_, body) = decode(old).await;
+        assert_eq!(body["value_omitted"], true);
+        assert!(body.get("value").is_none());
+        let fresh = response(state.clone(), json!({"identifier":"field-a"})).await;
+        public_hold(state, None).await;
+        let (_, body) = decode(fresh).await;
+        assert_eq!(body["value"], contract(8192)["value"]);
+    });
+}
+#[test]
+fn explicit_secure_kind_is_refused_without_a_runner_request() {
+    block(async {
+        let runner = mock_runner(|_, _| panic!("secure kind must not query native data"));
+        let (_, body) = decode(
+            response(
+                build_state_with_runner(runner.url()),
+                json!({"identifier":"password","kind":"SecureTextField"}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(body["error"], "secure_value_read_requires_human");
+        assert!(body.get("value").is_none());
+    });
+}

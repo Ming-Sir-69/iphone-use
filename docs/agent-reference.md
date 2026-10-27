@@ -1341,3 +1341,23 @@ The live panel waits for its opening tool's selection and uses it for frames
 and Home; a host that does not deliver tool input/result leaves the panel
 waiting, rather than guessing another target. This selects an installed daemon;
 it never changes a daemon's phone configuration or bypasses handoff/privacy/owner gates.
+
+
+### Complete selected AX values
+
+`POST /agent/value` (MCP `phone_read_value`) reads one current AX value selected
+by exactly one `identifier` or exact `label`, optionally `kind`. It never taps,
+focuses, unlocks, or takes a control lease. Ambiguous selectors refuse. Secure
+fields require a person; an older Runner without `ipu:valueRead` refuses rather
+than passing off a snapshot preview as full text.
+
+`max_utf16` is 1–65536 (default 8192). The reply carries `source`, `complete`,
+`truncated`, `utf16_length`, `returned_utf16_length` and `limit_utf16`. Clipping
+preserves surrogate pairs. Complete means this API did not clip the AX attribute;
+it does not prove that an app exposes its entire document. Owner changes, lease
+expiry, privacy changes or a control transition withhold an in-flight or queued
+value. Same-owner renewal and cleanup of an already expired owner preserve fresh
+permitted reads. Plan a fresh read only after checking current status.
+
+The Native complete-value route is explicitly opted into with `complete=1`;
+legacy element-value routes keep their existing scalar response.
