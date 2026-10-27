@@ -450,6 +450,65 @@ static BOOL IPURUseRequestCache(void)
   return attributes;
 }
 
++ (nullable NSDictionary<NSString *, id> *)readValueForAXElement:(id)element
+                                               maxUTF16Length:(NSUInteger)limit
+                                                  placeholder:(NSString *)placeholder
+                                                        error:(NSString **)errorMessage
+{
+  id client = [self axClient];
+  SEL selector = NSSelectorFromString(@"attributesForElement:attributes:error:");
+  if (client == nil || ![client respondsToSelector:selector]) {
+    if (errorMessage) *errorMessage = @"full AX value read unavailable";
+    return nil;
+  }
+  NSMethodSignature *signature = [client methodSignatureForSelector:selector];
+  if (signature.numberOfArguments != 5 || signature.methodReturnType[0] != '@' ||
+      [signature getArgumentTypeAtIndex:2][0] != '@' ||
+      [signature getArgumentTypeAtIndex:3][0] != '@' ||
+      [signature getArgumentTypeAtIndex:4][0] != '^' || [signature getArgumentTypeAtIndex:4][1] != '@') {
+    if (errorMessage) *errorMessage = @"full AX value selector shape unavailable";
+    return nil;
+  }
+  NSError *error = nil;
+  id attributes = nil;
+  @try {
+    typedef id (*ReadAttributes)(id, SEL, id, id, NSError **);
+    attributes = ((ReadAttributes)objc_msgSend)(client, selector, element,
+      @[@"XC_kAXXCAttributeValue"], &error);
+  } @catch (__unused NSException *exception) {
+    if (errorMessage) *errorMessage = @"full AX value read raised an exception";
+    return nil;
+  }
+  if (error != nil) {
+    if (errorMessage) *errorMessage = @"full AX value read failed";
+    return nil;
+  }
+  if (![attributes isKindOfClass:NSDictionary.class] || attributes[@"XC_kAXXCAttributeValue"] == nil) {
+    if (errorMessage) *errorMessage = @"full AX value attribute unavailable";
+    return nil;
+  }
+  id raw = attributes[@"XC_kAXXCAttributeValue"];
+  if (raw != NSNull.null && ![raw isKindOfClass:NSString.class] && ![raw isKindOfClass:NSNumber.class]) {
+    if (errorMessage) *errorMessage = @"full AX value is not scalar";
+    return nil;
+  }
+  NSString *value = raw == NSNull.null ? nil : ([raw isKindOfClass:NSString.class] ? raw : [(NSNumber *)raw stringValue]);
+  NSUInteger total = value.length;
+  limit = MAX((NSUInteger)1, MIN((NSUInteger)65536, limit));
+  NSUInteger end = MIN(total, limit);
+  if (end < total && end > 0 && CFStringIsSurrogateHighCharacter([value characterAtIndex:end - 1]) &&
+      CFStringIsSurrogateLowCharacter([value characterAtIndex:end])) end -= 1;
+  NSMutableDictionary *result = [@{@"value": value == nil ? (id)NSNull.null : [value substringToIndex:end],
+           @"complete": end == total ? @YES : @NO, @"truncated": end < total ? @YES : @NO,
+           @"utf16_length": @(total), @"returned_utf16_length": @(end),
+           @"limit_utf16": @(limit), @"source": @"ax_value_attribute"} mutableCopy];
+  // Compare before clipping, including when the caller requests only one UTF-16
+  // unit. This private flag alone does not establish that the field is empty.
+  result[@"_value_matches_placeholder"] = @([value isEqualToString:placeholder] && placeholder.length > 0);
+  return result;
+}
+
+
 + (nullable id)requestSnapshotForElement:(id)element
                                 maxDepth:(NSInteger)maxDepth
                                 maxNodes:(NSInteger)maxNodes
@@ -606,6 +665,8 @@ static NSMutableDictionary *IPURSerialize(
   // runner's name: the identifier when there is one, else the label.
   node[@"name"] = identifier ?: label ?: (id)NSNull.null;
   node[@"value"] = value ?: (id)NSNull.null;
+  id valueTruncated = IPURKVC(snapshot, @"isTruncatedValue");
+  if (![node[@"type"] isEqual:@"XCUIElementTypeSecureTextField"] && [valueTruncated isKindOfClass:NSNumber.class]) node[@"value_truncated"] = @([valueTruncated boolValue]);
   node[@"rawIdentifier"] = identifier ?: (id)NSNull.null;
   node[@"placeholderValue"] = placeholder ?: (id)NSNull.null;
   node[@"rect"] = IPURRect(snapshot);

@@ -97,6 +97,9 @@ extension RunnerTests {
       if let id = match(parts, "element/:id/elements")?.first { return try findElements(request, from: id) }
       if let id = match(parts, "element/:id/element")?.first { return try findElement(request, from: id) }
       if let id = match(parts, "element/:id/click")?.first { return try clickElement(id) }
+      if request.query["complete"] == "1", let id = match(parts, "element/:id/value")?.first {
+        return try elementValue(id, request: request)
+      }
       if let id = match(parts, "element/:id/value")?.first { return try setElementValue(id, request) }
       if let id = match(parts, "element/:id/clear")?.first { return try clearElement(id) }
       if let captures = match(parts, "wda/element/:id/:action") {
@@ -133,6 +136,7 @@ extension RunnerTests {
       "device": UIDevice.current.userInterfaceIdiom == .pad ? "ipad" : "iphone",
       "sdkVersion": Self.systemVersion,
       "ipu:timedDragPath": true,
+      "ipu:valueRead": true,
       "browserName": NSNull(),
       "CFBundleIdentifier": NSNull(),
     ]
@@ -289,6 +293,52 @@ extension RunnerTests {
 
   private func elementRect(_ id: String) throws -> HTTPResponse {
     .value(rectValue(try freshNode(id).rect))
+  }
+
+  private func fullElementValue(_ id: String, limit: Int) throws -> [String: Any] {
+    let node = try freshNode(id)
+    guard node.type != "XCUIElementTypeSecureTextField" else {
+      throw RunnerError.invalidArgument("secure_value_read_requires_human")
+    }
+    IPURBridge.invalidateRequestCache()
+    guard node.pid > 0, node.pid == foreground().pid, let ax = node.axElement else {
+      throw RunnerError.staleElement(id)
+    }
+    var error: NSString?
+    guard let result = IPURBridge.readValue(for: ax, maxUTF16: UInt(limit), placeholder: node.placeholder, error: &error) else {
+      throw RunnerError.unsupported("full AX value read unavailable")
+    }
+    IPURBridge.invalidateRequestCache()
+    let after = try freshNode(id)
+    guard after.pid == foreground().pid, after.pid == node.pid,
+          after.type == node.type, after.identifier == node.identifier,
+          node.identifier != nil || after.label == node.label,
+          after.type != "XCUIElementTypeSecureTextField" else {
+      throw RunnerError.staleElement(id)
+    }
+    var value = result as [String: Any]
+    let matchesPlaceholder = (value.removeValue(forKey: "_value_matches_placeholder") as? NSNumber)?.boolValue == true
+    // Some providers return the placeholder as their raw Value for an empty
+    // TextField. Require both live snapshots to be empty and the same placeholder;
+    // literal user text equal to a placeholder must remain ordinary content.
+    if matchesPlaceholder, ["XCUIElementTypeTextField", "XCUIElementTypeSearchField", "XCUIElementTypeTextView"].contains(node.type),
+       (node.value ?? "").isEmpty, (after.value ?? "").isEmpty,
+       node.placeholder == after.placeholder {
+      value["value"] = ""
+      value["complete"] = true; value["truncated"] = false
+      value["utf16_length"] = 0; value["returned_utf16_length"] = 0
+      value["placeholder_shown"] = true
+    }
+    return value
+  }
+
+  private func elementValue(_ id: String, request: HTTPRequest) throws -> HTTPResponse {
+    let raw = request.query["max_utf16"]
+    let limit = raw.flatMap(Int.init) ?? 32768
+    guard raw == nil || Int(raw!) != nil, (1...65536).contains(limit) else {
+      throw RunnerError.invalidArgument("max_utf16 must be 1...65536")
+    }
+    return .value(try fullElementValue(id, limit: limit))
   }
 
   private func elementAttribute(_ id: String, _ name: String) throws -> HTTPResponse {
