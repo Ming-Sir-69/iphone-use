@@ -77,6 +77,9 @@ extension RunnerTests {
       if let captures = match(parts, "element/:id/attribute/:name") {
         return try elementAttribute(captures[0], captures[1])
       }
+      if request.query["complete"] == "1", let id = match(parts, "element/:id/value")?.first {
+        return try elementValue(id, request: request)
+      }
       if let id = match(parts, "element/:id/text")?.first {
         let node = try freshNode(id)
         return .value(node.label ?? node.value ?? "")
@@ -97,9 +100,6 @@ extension RunnerTests {
       if let id = match(parts, "element/:id/elements")?.first { return try findElements(request, from: id) }
       if let id = match(parts, "element/:id/element")?.first { return try findElement(request, from: id) }
       if let id = match(parts, "element/:id/click")?.first { return try clickElement(id) }
-      if request.query["complete"] == "1", let id = match(parts, "element/:id/value")?.first {
-        return try elementValue(id, request: request)
-      }
       if let id = match(parts, "element/:id/value")?.first { return try setElementValue(id, request) }
       if let id = match(parts, "element/:id/clear")?.first { return try clearElement(id) }
       if let captures = match(parts, "wda/element/:id/:action") {

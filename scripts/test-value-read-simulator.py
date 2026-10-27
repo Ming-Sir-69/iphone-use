@@ -108,7 +108,7 @@ def main():
         status,flag=api({'identifier':'flag-field'});assert status==200 and flag['complete'] is True and flag['value'] in ['1','true']
         ids,_=drag.runner_call(args,'/elements',{'using':'predicate string','value':"identifier == 'emoji-field'"})
         element=ids['value'][0].get('ELEMENT') or ids['value'][0]['element-6066-11e4-a52e-4f735466cecf']
-        legacy,_=drag.runner_call(args,f'/element/{element}/value');assert isinstance(legacy['value'],str),'legacy scalar route changed'
+        legacy,_=drag.runner_call(args,f'/element/{element}/attribute/value');assert isinstance(legacy['value'],str),'snapshot attribute route changed'
         home=args.out/'mcp-home';home.mkdir(mode=0o700)
         peer=Peer(args.mcp.resolve(),args.base,args.owner,home,args.out/'mcp.log')
         reply=peer.call('tools/call',{'name':'phone_read_value','arguments':{'identifier':'complete-field'}})
@@ -117,7 +117,7 @@ def main():
         observed=next(json.loads(text) for text in texts if text.startswith('{'))
         assert observed['value']==expected and sum(text.count(expected) for text in texts)==1
         assert 'value' not in reply['result'].get('structuredContent',{})
-        result['cases'] += [{'case':name,'passed':True} for name in ['quoted-label','secure-refusal','ambiguity','missing','boolean','legacy-scalar','real-stdio-single-copy']]
+        result['cases'] += [{'case':name,'passed':True} for name in ['quoted-label','secure-refusal','ambiguity','missing','boolean','snapshot-attribute-scalar','real-stdio-single-copy']]
         after=json.loads(receipt.read_text());assert after==before,'read changed App state or focus'
         after_status=daemon.require_simulator(args.udid);assert after_status.get('owner')==before_status.get('owner'),'read changed owner lease'
         result.update(passed=True,app_state_unchanged=True,owner_unchanged=True)
