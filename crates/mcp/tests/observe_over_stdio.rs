@@ -594,7 +594,7 @@ fn reconnect_wait_budget_bounds_slow_status_and_sends_only_one_reconnect() {
     assert_eq!(body["wait"]["outcome"],"timeout","{body}");
     assert!(elapsed<Duration::from_secs(2),"wait_secs=1 exceeded budget: {elapsed:?}");
     let requests=daemon.requests.lock().unwrap();
-    assert_eq!(requests.iter().filter(|request|request.starts_with("POST /agent/reconnect ")).count(),1);
+    assert_eq!(requests.iter().filter(|request|request.starts_with("POST /agent/mode ")).count(),1);
 }
 #[test]
 fn reconnect_wait_stops_on_a_phone_exit_even_if_ready_was_stale() {
@@ -604,5 +604,5 @@ fn reconnect_wait_stops_on_a_phone_exit_even_if_ready_was_stale() {
     let reply=child.call_tool(2,"phone_reconnect",serde_json::json!({"wait_secs":1}));
     let body:serde_json::Value=serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(body["wait"]["outcome"],"stopped","{body}");
-    assert_eq!(daemon.requests.lock().unwrap().iter().filter(|request|request.starts_with("POST /agent/reconnect ")).count(),1);
+    assert_eq!(daemon.requests.lock().unwrap().iter().filter(|request|request.starts_with("POST /agent/mode ")).count(),1);
 }
