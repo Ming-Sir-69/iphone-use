@@ -33,6 +33,9 @@ impl ScriptedDaemon {
     }
 
     fn routed(status: &'static str, body: Vec<u8>, status_body: Option<Vec<u8>>) -> Self {
+        Self::status_delayed(status,body,status_body,Duration::ZERO)
+    }
+    fn status_delayed(status: &'static str, body: Vec<u8>, status_body: Option<Vec<u8>>, delay: Duration) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -71,6 +74,7 @@ impl ScriptedDaemon {
                         seen.lock().unwrap().push(String::from_utf8_lossy(&request).into_owned());
                         let status_read = request.windows(2).any(|bytes| bytes == b"\r\n")
                             && request.starts_with(b"GET /agent/status ");
+                        if status_read { std::thread::sleep(delay); }
                         let truncated = status == "200 Truncated" && !status_read;
                         let response_status = if status_read && status_body.is_some() || truncated { "200 OK" } else { status };
                         let body = if status_read { status_body.as_ref().unwrap_or(&body) } else { &body };
@@ -582,6 +586,44 @@ fn registry_without_flows_does_not_query_phone_inventory() {
             assert_eq!(requests.len(),1,"a screen with no flows must only read its elements: {requests:?}");
         }
     }
+}
+
+#[test]
+fn reconnect_wait_budget_bounds_slow_status_and_sends_only_one_reconnect() {
+    let daemon=ScriptedDaemon::status_delayed("200 OK",br#"{"ok":true,"starting":true,"reconnecting":true}"#.to_vec(),
+        Some(br#"{"ok":true,"drivable":true,"reconnecting":false}"#.to_vec()),Duration::from_secs(3));
+    let mut child=McpChild::start_with(&daemon.url,"off");
+    let start=Instant::now();let reply=child.call_tool(2,"phone_reconnect",serde_json::json!({"wait_secs":1}));
+    let elapsed=start.elapsed();
+    let text=reply["result"]["content"][0]["text"].as_str().unwrap();
+    let body:serde_json::Value=serde_json::from_str(text).unwrap();
+    assert_eq!(body["wait"]["outcome"],"timeout","{body}");
+    assert!(elapsed<Duration::from_secs(2),"wait_secs=1 exceeded budget: {elapsed:?}");
+    let requests=daemon.requests.lock().unwrap();
+    assert_eq!(requests.iter().filter(|request|request.starts_with("POST /agent/mode ")).count(),1);
+}
+#[test]
+fn reconnect_wait_stops_on_a_phone_exit_even_if_ready_was_stale() {
+    let daemon=ScriptedDaemon::routed("200 OK",br#"{"ok":true,"starting":true}"#.to_vec(),
+        Some(br#"{"ok":true,"drivable":true,"reconnecting":true,"runner_parked":true,"ended_on_phone":true,"setup_blocked_on":"usb"}"#.to_vec()));
+    let mut child=McpChild::start_with(&daemon.url,"off");
+    let reply=child.call_tool(2,"phone_reconnect",serde_json::json!({"wait_secs":1}));
+    let body:serde_json::Value=serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["wait"]["outcome"],"stopped","{body}");
+    assert_eq!(daemon.requests.lock().unwrap().iter().filter(|request|request.starts_with("POST /agent/mode ")).count(),1);
+}
+
+#[test]
+fn reconnect_wait_transient_blocker_does_not_end_a_short_budget_early() {
+    let daemon = ScriptedDaemon::routed("200 OK", br#"{"ok":true,"starting":true}"#.to_vec(),
+        Some(br#"{"ok":true,"drivable":false,"reconnecting":true,"setup_blocked_on":"usb","setup_phase":"ddi-wait"}"#.to_vec()));
+    let mut child = McpChild::start_with(&daemon.url,"off");
+    let started = Instant::now();
+    let reply = child.call_tool(2,"phone_reconnect",serde_json::json!({"wait_secs":1}));
+    let body: serde_json::Value = serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["wait"]["outcome"], "timeout", "{body}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(daemon.requests.lock().unwrap().iter().filter(|r| r.starts_with("POST /agent/mode ")).count(), 1);
 }
 
 #[test]

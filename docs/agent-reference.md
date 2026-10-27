@@ -1352,6 +1352,14 @@ waiting, rather than guessing another target. This selects an installed daemon;
 it never changes a daemon's phone configuration or bypasses handoff/privacy/owner gates.
 
 
+All observing batches retain the privacy generation from request entry. A private
+on/off transition cancels that observation and later steps; queued response
+bodies withhold screen observations and wait verdicts while preserving known action delivery receipts.
+`phone_reconnect(wait_secs=N)` bounds each status read by the remaining wait
+budget and returns `stopped` for recorded phone exit, parking or human handoff.
+Only the initial reconnect request can start recovery; waiting never sends a
+second reconnect.
+
 ### Complete selected AX values
 
 `POST /agent/value` (MCP `phone_read_value`) reads one current AX value selected
@@ -1369,4 +1377,4 @@ value. Same-owner renewal and cleanup of an already expired owner preserve fresh
 permitted reads. Plan a fresh read only after checking current status.
 
 The Native complete-value route is explicitly opted into with `complete=1`;
-legacy element-value routes keep their existing scalar response.
+existing attribute/value snapshot reads and POST value writes keep their contracts.
