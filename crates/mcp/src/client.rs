@@ -1970,6 +1970,24 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn compound_tab_caption_suggests_the_full_label_without_sending_a_tap() {
+        let elements = serde_json::json!({"snapshot":"tabs-v1","elements":[
+            {"kind":"Button","label":"Teclado, tab, 1 of 3"},
+            {"kind":"Button","label":"Conversas, tab, 2 of 3"},
+            {"kind":"Button","label":"Histórico, tab, 3 of 3"}
+        ]}).to_string();
+        let (url, task, requests) = mock_daemon_sequence(&[("200 OK", &elements)]);
+        let failure = DaemonClient::new(url, None).tap_label_observed("Conversas", false)
+            .await.expect_err("a suggestion must remain before dispatch");
+        task.join().unwrap();
+        assert!(matches!(failure, TapLabelFailure::BeforeDispatch(_)), "{failure}");
+        assert!(failure.to_string().contains("did you mean \"Conversas, tab, 2 of 3\""), "{failure}");
+        let sent: Vec<String> = requests.try_iter().collect();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].starts_with("GET /agent/elements"), "{sent:?}");
+    }
+
     /// The element read itself failing is also before dispatch.
     #[tokio::test]
     async fn an_unreadable_tree_fails_before_any_tap() {
