@@ -68,7 +68,7 @@ fi
 git diff --quiet || git commit -qm "chore(release): v$V" -- $CRATES $VERSIONED_JSON Cargo.lock
 trap - EXIT
 git tag "v$V"
-git push -q origin main "v$V"
+git push --atomic -q origin main "v$V"
 
 # release-binaries.yml builds, signs and publishes the Release on the tag push; the plugin must not
 # update before its binaries exist.
