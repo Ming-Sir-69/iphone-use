@@ -144,8 +144,25 @@ class Daemon:
             data = json.dumps(body).encode()
             headers.update({"Content-Type": "application/json", "X-Phone-Control": "1"})
         request = urllib.request.Request(self.base + path, data=data, headers=headers)
-        with urllib.request.urlopen(request, timeout=40) as response:
-            return json.load(response)
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(request, timeout=40) as response:
+                    return json.load(response)
+            except urllib.error.HTTPError as error:
+                # A healthy Runner may finish its slow AX read after the first
+                # response. Retry only that read, once, never a dispatched action.
+                if attempt or body is not None or path.split("?", 1)[0] != "/agent/elements" or error.code != 504:
+                    raise
+                try:
+                    busy = json.loads(error.read(65536))
+                except (ValueError, OSError):
+                    raise error
+                delay = busy.get("retry_after_secs") if isinstance(busy, dict) else None
+                if (not isinstance(busy, dict) or busy.get("error") != "runner_source_timeout"
+                        or busy.get("runner_busy") is not True or type(delay) is not int or not 1 <= delay <= 60):
+                    raise
+                error.close()
+                time.sleep(delay)
 
     def require_simulator(self, udid):
         status = self.call("/agent/status")
