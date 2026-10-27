@@ -55,12 +55,14 @@ def main():
     pbx.write_text(pbx.read_text().replace('com.leeguoo.iphone-use.gesture-fixture',BUNDLE))
     info=project/'Info.plist';metadata=plistlib.loads(info.read_bytes())
     metadata.update(CFBundleIdentifier=BUNDLE,CFBundleName='Value Read Fixture',CFBundleDisplayName='Value Read Fixture')
-    metadata.pop('UIApplicationSceneManifest',None)
+    metadata['CFBundleVersion']='2'
+    metadata['UIApplicationSceneManifest']={'UIApplicationSupportsMultipleScenes':False,'UISceneConfigurations':{'UIWindowSceneSessionRoleApplication':[{'UISceneConfigurationName':'Value Fixture','UISceneDelegateClassName':'$(PRODUCT_MODULE_NAME).ValueSceneDelegate'}]}}
     info.write_bytes(plistlib.dumps(metadata))
     drag.ROOT=fixture_root;app=drag.build_fixture(args.out)
     built_info=plistlib.loads((app/'Info.plist').read_bytes())
     assert built_info['CFBundleIdentifier']==BUNDLE,'built fixture identity differs; nothing installed'
-    assert 'UIApplicationSceneManifest' not in built_info,'unexpected template Scene configuration'
+    scenes=built_info['UIApplicationSceneManifest']['UISceneConfigurations']['UIWindowSceneSessionRoleApplication']
+    assert scenes[0]['UISceneDelegateClassName']=='GestureFixture.ValueSceneDelegate','unexpected fixture Scene delegate'
 
     opener=urllib.request.build_opener(urllib.request.ProxyHandler({}));installed=False;peer=None
     result={'scope':'owned Simulator-only read conformance','input_sent':False,'cases':[]};cleanup=[]
@@ -76,6 +78,7 @@ def main():
         receipt=data/'Documents/value-state.json';deadline=time.monotonic()+20
         while not receipt.exists() and time.monotonic()<deadline:time.sleep(.1)
         before=json.loads(receipt.read_text());assert before['events']==0 and not before['focused']
+        assert before.get('fixture_variant')=='scene' and before.get('bundle_version')=='2'
         active,_=drag.runner_call(args,'/wda/activeAppInfo');assert active['value']['bundleId']==BUNDLE and active['value']['pid']==before['pid']
         expected='value-root-'+'字'*6015+'🙂';sha=hashlib.sha256(expected.encode()).hexdigest()
         assert before['sha256']==sha

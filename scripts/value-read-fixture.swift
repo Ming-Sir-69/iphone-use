@@ -44,7 +44,7 @@ final class ValueController: UIViewController, UITextViewDelegate {
   func save() {
     let text = long.text ?? ""
     let sha = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
-    let state: [String: Any] = ["pid": ProcessInfo.processInfo.processIdentifier,
+    let state: [String: Any] = ["fixture_variant": "scene", "bundle_version": Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "", "pid": ProcessInfo.processInfo.processIdentifier,
       "events": events, "focused": long.isFirstResponder || fields.contains(where: { $0.isFirstResponder }),
       "sha256": sha, "utf16_length": text.utf16.count, "flag": flag.isOn]
     let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("value-state.json")
@@ -52,10 +52,19 @@ final class ValueController: UIViewController, UITextViewDelegate {
   }
 }
 final class ValueAppDelegate: UIResponder, UIApplicationDelegate {
+  func application(_ application: UIApplication, didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]?) -> Bool { true }
+  func application(_ application: UIApplication, configurationForConnecting session: UISceneSession, options: UIScene.ConnectionOptions) -> UISceneConfiguration {
+    let configuration = UISceneConfiguration(name: "Value Fixture", sessionRole: session.role)
+    configuration.delegateClass = ValueSceneDelegate.self
+    return configuration
+  }
+}
+final class ValueSceneDelegate: UIResponder, UIWindowSceneDelegate {
   var window: UIWindow?
-  func application(_ application: UIApplication, didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-    let window = UIWindow(frame: UIScreen.main.bounds); window.rootViewController = ValueController()
-    window.makeKeyAndVisible(); self.window = window; return true
+  func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options: UIScene.ConnectionOptions) {
+    guard let scene = scene as? UIWindowScene else { return }
+    let window = UIWindow(windowScene: scene)
+    window.rootViewController = ValueController(); window.makeKeyAndVisible(); self.window = window
   }
 }
 UIApplicationMain(CommandLine.argc, CommandLine.unsafeArgv, nil, NSStringFromClass(ValueAppDelegate.self))
