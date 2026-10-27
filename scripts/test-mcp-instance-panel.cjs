@@ -19,8 +19,9 @@ function panel(body={released:true,drivable:false,phone:'mock'}) {
   const parent = {postMessage(message) {
     if (message.method === 'tools/call') calls.push(message.params);
     if (message.id !== undefined && message.method) queueMicrotask(() => notify({
-      jsonrpc:'2.0', id:message.id, result: message.method === 'ui/initialize'
-        ? {hostContext:{}} : {structuredContent:body}
+      jsonrpc:'2.0', id:message.id, ...(message.method === 'ui/initialize'
+        ? {result:{hostContext:{}}} : body.transportError
+          ? {error:{code:-32000,message:'lost host reply'}} : {result:{structuredContent:body}})
     }));
   }};
   const window = {parent, innerWidth:320, addEventListener(name, callback) {listeners[name] = callback;}};
@@ -71,5 +72,13 @@ function panel(body={released:true,drivable:false,phone:'mock'}) {
   await privacy.element('refresh').events.click();await privacy.flush();
   assert.equal(privacy.element('image').hidden,true,'capture refusal clears previously displayed pixels');
   assert.equal(privacy.element('image').src,undefined);
+  frame.clear_frame=false;frame.frame={mime_type:'image/png',data:'new-fixture'};
+  await privacy.element('refresh').events.click();await privacy.flush();
+  assert.equal(privacy.element('image').hidden,false);
+  frame.transportError=true;
+  await privacy.element('refresh').events.click();await privacy.flush();
+  assert.equal(privacy.element('image').hidden,true,'host RPC failure must clear old pixels');
+  assert.equal(privacy.element('image').src,undefined);
+
   console.log('MCP panel: waits for binding; frame and Home stay on one instance; invalid input and teardown fail closed');
 })().catch(error=>{console.error(error);process.exitCode=1;});

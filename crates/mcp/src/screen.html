@@ -242,6 +242,13 @@
     return parts.join(" · ");
   }
 
+  function clearFrame(message) {
+    image.hidden = true;
+    image.removeAttribute("src");
+    empty.textContent = message;
+    empty.hidden = false;
+  }
+
   function show(body) {
     if (!body || typeof body !== "object") throw new Error("empty frame");
     const tone = body.error && !body.frame ? "bad"
@@ -254,12 +261,9 @@
     }
     if (body.private_secs || body.clear_frame) {
       setStatus("warn", describe(body));
-      image.hidden = true;
-      image.removeAttribute("src");
-      empty.textContent = body.private_secs
+      clearFrame(body.private_secs
         ? t("Someone is signing in on the phone. The screen stays hidden until the agent continues.")
-        : t("Waiting for a new permitted frame.");
-      empty.hidden = false;
+        : t("Waiting for a new permitted frame."));
       return false;
     }
     setStatus(tone, text);
@@ -317,6 +321,7 @@
       failures = 0;
       delay = live ? Math.max(0, FRAME_INTERVAL_MS - (performance.now() - started)) : IDLE_INTERVAL_MS;
     } catch (error) {
+      clearFrame(t("Waiting for a new permitted frame."));
       failures += 1;
       delay = Math.min(5000, 1000 * failures);
       if (failures > 1) setStatus("bad", t("panel cannot reach iphone-use — {error}", { error: t(error.message) }));

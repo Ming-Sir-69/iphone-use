@@ -525,6 +525,7 @@ fn failed_capture_clears_old_pixels_despite_racing_open_status() {
         let mut child = McpChild::start_with(&daemon.url, "off");
         let reply = child.call_tool(2, "phone_screen_frame", serde_json::json!({}));
         let body = &reply["result"]["structuredContent"];
+        assert_eq!(body["drivable"], true, "status fixture must remain open: {body}");
         assert!(body["private_secs"].is_null());
         assert!(body["frame"].is_null());
         assert_eq!(body["clear_frame"], true, "{body}");
