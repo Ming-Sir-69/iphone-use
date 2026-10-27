@@ -1,6 +1,9 @@
 //! Real router + delayed scripted runner. No personal daemon or phone is used.
 mod support;
-use axum::{body::Body, http::{Request, StatusCode}};
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
 use base64::Engine as _;
 use http_body_util::BodyExt;
 use serde_json::json;
@@ -8,44 +11,89 @@ use std::{sync::Arc, time::Duration};
 use support::{block, build_state_with_runner, mock_runner};
 use tower::ServiceExt;
 
-async fn hold(state:Arc<server::http::AppState>, private:bool) {
-    let response=server::http::router(state).oneshot(Request::builder().method("POST").uri("/agent/hold")
-        .header("x-phone-control","1").header("x-phone-owner","privacy-fixture").header("content-type","application/json")
-        .body(Body::from(json!({"secs":if private {60} else {0},"private":private}).to_string())).unwrap()).await.unwrap();
-    assert_eq!(response.status(),StatusCode::OK);
+async fn hold(state: Arc<server::http::AppState>, private: bool) {
+    let response = server::http::router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/agent/hold")
+                .header("x-phone-control", "1")
+                .header("x-phone-owner", "privacy-fixture")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"secs":if private {60} else {0},"private":private}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
-async fn race(clear:bool) {
-    for uri in ["/agent/screenshot?raw=1", "/agent/screenshot?overlay=elements&fresh=1", "/agent/elements?ocr=off"] {
-        let started=Arc::new(tokio::sync::Notify::new());
-        let signal=started.clone();
-        let png=base64::engine::general_purpose::STANDARD.encode(include_bytes!("fixtures/privacy.png"));
-        let delay_source=!uri.contains("raw=1");
-        let runner=mock_runner(move |request,_| {
-            if request.starts_with("POST /session ") {return Some((Duration::ZERO,json!({"value":{"sessionId":"SESSION"}}).to_string()));}
+async fn race(clear: bool) {
+    for uri in [
+        "/agent/screenshot?raw=1",
+        "/agent/screenshot?overlay=elements&fresh=1",
+        "/agent/elements?ocr=off",
+    ] {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let signal = started.clone();
+        let png = base64::engine::general_purpose::STANDARD
+            .encode(include_bytes!("fixtures/privacy.png"));
+        let delay_source = !uri.contains("raw=1");
+        let runner = mock_runner(move |request, _| {
+            if request.starts_with("POST /session ") {
+                return Some((
+                    Duration::ZERO,
+                    json!({"value":{"sessionId":"SESSION"}}).to_string(),
+                ));
+            }
             if request.contains("/screenshot") {
-                if !delay_source {signal.notify_one();}
-                return Some((if delay_source {Duration::ZERO} else {Duration::from_millis(400)},json!({"value":png}).to_string()));
+                if !delay_source {
+                    signal.notify_one();
+                }
+                return Some((
+                    if delay_source {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_millis(400)
+                    },
+                    json!({"value":png}).to_string(),
+                ));
             }
             if request.contains("/source") {
-                if delay_source {signal.notify_one();}
+                if delay_source {
+                    signal.notify_one();
+                }
                 return Some((Duration::from_millis(400),json!({"value":{"type":"XCUIElementTypeApplication","label":"PRIVATE_FIXTURE","rect":{"x":0,"y":0,"width":390,"height":844},"children":[{"type":"XCUIElementTypeButton","label":"PRIVATE_LABEL","rect":{"x":10,"y":10,"width":100,"height":40},"enabled":true,"visible":true}]}}).to_string()));
             }
-            Some((Duration::ZERO,json!({"value":null}).to_string()))
+            Some((Duration::ZERO, json!({"value":null}).to_string()))
         });
-        let state=build_state_with_runner(runner.url());
-        let app=server::http::router(state.clone());
-        let read=tokio::spawn(async move {app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap()).await.unwrap()});
-        tokio::time::timeout(Duration::from_secs(4),started.notified()).await.expect("delayed screen read started");
-        hold(state.clone(),true).await;
-        if clear {hold(state.clone(),false).await;}
-        let response=read.await.unwrap();
-        let status=response.status();
-        let bytes=response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(status,StatusCode::LOCKED,"{uri}, clear={clear}: privacy transition must discard the completed screen read");
-        let text=String::from_utf8_lossy(&bytes);
-        assert!(!text.contains("PRIVATE_LABEL")&&!text.contains("PRIVATE_FIXTURE"));
-        let body:serde_json::Value=serde_json::from_slice(&bytes).unwrap();
+        let state = build_state_with_runner(runner.url());
+        let app = server::http::router(state.clone());
+        let read = tokio::spawn(async move {
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(4), started.notified())
+            .await
+            .expect("delayed screen read started");
+        hold(state.clone(), true).await;
+        if clear {
+            hold(state.clone(), false).await;
+        }
+        let response = read.await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            status,
+            StatusCode::LOCKED,
+            "{uri}, clear={clear}: privacy transition must discard the completed screen read"
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("PRIVATE_LABEL") && !text.contains("PRIVATE_FIXTURE"));
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(body.get("image").is_none());
         assert!(state.element_snapshots.lock().unwrap().is_empty());
         assert!(state.owner_snapshots.lock().unwrap().is_empty());
@@ -53,67 +101,143 @@ async fn race(clear:bool) {
 }
 
 #[test]
-fn in_flight_screen_reads_are_discarded_when_a_private_hold_begins() {block(race(false));}
+fn in_flight_screen_reads_are_discarded_when_a_private_hold_begins() {
+    block(race(false));
+}
 #[test]
-fn in_flight_screen_reads_are_discarded_even_after_private_hold_is_lifted() {block(race(true));}
+fn in_flight_screen_reads_are_discarded_even_after_private_hold_is_lifted() {
+    block(race(true));
+}
 
 #[test]
 fn a_private_transition_invalidates_the_settled_frame_cache() {
     block(async {
-        let fresh=include_bytes!("fixtures/privacy.png").to_vec();
-        let b64=base64::engine::general_purpose::STANDARD.encode(&fresh);
-        let runner=mock_runner(move |request,_|Some((Duration::ZERO,if request.starts_with("POST /session ") {
-            json!({"value":{"sessionId":"SESSION"}}).to_string()
-        } else if request.contains("/screenshot") {json!({"value":b64}).to_string()} else {json!({"value":null}).to_string()})));
-        let state=build_state_with_runner(runner.url());
-        state.runner.as_ref().unwrap().lock().await.remember_settled_frame(server::runner::Capture::full_png(include_bytes!("fixtures/privacy-old.png").to_vec()));
-        hold(state.clone(),true).await;hold(state.clone(),false).await;
-        let response=server::http::router(state).oneshot(Request::builder().uri("/agent/screenshot?max_side=600").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(response.status(),StatusCode::OK);
-        let bytes=response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(&bytes[..],&fresh[..],"a private transition must not reuse the previous settled frame");
+        let fresh = include_bytes!("fixtures/privacy.png").to_vec();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&fresh);
+        let runner = mock_runner(move |request, _| {
+            Some((
+                Duration::ZERO,
+                if request.starts_with("POST /session ") {
+                    json!({"value":{"sessionId":"SESSION"}}).to_string()
+                } else if request.contains("/screenshot") {
+                    json!({"value":b64}).to_string()
+                } else {
+                    json!({"value":null}).to_string()
+                },
+            ))
+        });
+        let state = build_state_with_runner(runner.url());
+        state
+            .runner
+            .as_ref()
+            .unwrap()
+            .lock()
+            .await
+            .remember_settled_frame(server::runner::Capture::full_png(
+                include_bytes!("fixtures/privacy-old.png").to_vec(),
+            ));
+        hold(state.clone(), true).await;
+        hold(state.clone(), false).await;
+        let response = server::http::router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/screenshot?max_side=600")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            &bytes[..],
+            &fresh[..],
+            "a private transition must not reuse the previous settled frame"
+        );
     });
 }
 
 #[test]
 fn open_mjpeg_and_h264_feeds_do_not_resume_after_a_brief_private_hold() {
     block(async {
-        use tokio::io::{AsyncReadExt,AsyncWriteExt};
-        for h264 in [false,true] {
-            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address=listener.local_addr().unwrap();
-            let (release_tx,release_rx)=tokio::sync::oneshot::channel::<()>();
-            let source=tokio::spawn(async move {
-                let (mut socket,_)=listener.accept().await.unwrap();
-                let mut request=vec![0u8;4096];let _=socket.read(&mut request).await.unwrap();
-                let head=if h264 {"HTTP/1.0 200 OK\r\nX-Video-Format: iphone-use-h264-annexb-v1\r\n\r\n"}
-                    else {"HTTP/1.0 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n"};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for h264 in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let source = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0u8; 4096];
+                let _ = socket.read(&mut request).await.unwrap();
+                let head = if h264 {
+                    "HTTP/1.0 200 OK\r\nX-Video-Format: iphone-use-h264-annexb-v1\r\n\r\n"
+                } else {
+                    "HTTP/1.0 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n"
+                };
                 socket.write_all(head.as_bytes()).await.unwrap();
-                let frame=|byte:u8| if h264 {server::video::frame_message(&server::video::H264Frame{
-                    data:bytes::Bytes::from(vec![0,0,0,1,0x65,byte]),keyframe:true,pts_micros:byte as u64}).to_vec()}
-                    else {vec![byte;32]};
+                let frame = |byte: u8| {
+                    if h264 {
+                        server::video::frame_message(&server::video::H264Frame {
+                            data: bytes::Bytes::from(vec![0, 0, 0, 1, 0x65, byte]),
+                            keyframe: true,
+                            pts_micros: byte as u64,
+                        })
+                        .to_vec()
+                    } else {
+                        vec![byte; 32]
+                    }
+                };
                 socket.write_all(&frame(b'A')).await.unwrap();
-                let _=release_rx.await;
-                let _=socket.write_all(&frame(b'B')).await;
-                let _=tokio::time::timeout(Duration::from_secs(2),socket.read(&mut request)).await;
+                let _ = release_rx.await;
+                let _ = socket.write_all(&frame(b'B')).await;
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(2), socket.read(&mut request)).await;
             });
-            let mut state=support::build_state(None);
-            let inner=Arc::get_mut(&mut state).unwrap();
-            inner.mjpeg_url=Some(format!("http://{address}"));
-            if h264 {inner.video=Some(server::video::VideoHub::new(format!("http://{address}")));}
-            let response=server::http::router(state.clone()).oneshot(Request::builder()
-                .uri(if h264 {"/agent/h264"} else {"/agent/mjpeg"}).body(Body::empty()).unwrap()).await.unwrap();
-            assert_eq!(response.status(),StatusCode::OK);
-            let mut body=response.into_body();
-            let first=tokio::time::timeout(Duration::from_secs(4),body.frame()).await.unwrap().unwrap().unwrap().into_data().unwrap();
-            assert_eq!(first.last().copied(),Some(b'A'));
-            hold(state.clone(),true).await;hold(state.clone(),false).await;
-            let _=release_tx.send(());
-            let next=tokio::time::timeout(Duration::from_secs(3),body.frame()).await.unwrap();
-            assert!(next.is_none(),"h264={h264}: an old feed must end across private on/off rather than forwarding B");
+            let mut state = support::build_state(None);
+            let inner = Arc::get_mut(&mut state).unwrap();
+            inner.mjpeg_url = Some(format!("http://{address}"));
+            if h264 {
+                inner.video = Some(server::video::VideoHub::new(format!("http://{address}")));
+            }
+            let response = server::http::router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri(if h264 { "/agent/h264" } else { "/agent/mjpeg" })
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body();
+            let first = tokio::time::timeout(Duration::from_secs(4), body.frame())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .into_data()
+                .unwrap();
+            assert_eq!(first.last().copied(), Some(b'A'));
+            hold(state.clone(), true).await;
+            hold(state.clone(), false).await;
+            let _ = release_tx.send(());
+            let next = tokio::time::timeout(Duration::from_secs(3), body.frame())
+                .await
+                .unwrap();
+            assert!(
+                next.is_none(),
+                "h264={h264}: an old feed must end across private on/off rather than forwarding B"
+            );
             drop(body);
-            assert_eq!(state.live_streams.load(std::sync::atomic::Ordering::Acquire),0);
-            if let Some(hub)=&state.video {assert_eq!(hub.subscriber_count(),0);}
+            assert_eq!(
+                state
+                    .live_streams
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0
+            );
+            if let Some(hub) = &state.video {
+                assert_eq!(hub.subscriber_count(), 0);
+            }
             source.abort();
         }
     });
@@ -122,33 +246,115 @@ fn open_mjpeg_and_h264_feeds_do_not_resume_after_a_brief_private_hold() {
 #[test]
 fn a_queued_response_body_cannot_publish_after_a_private_transition() {
     block(async {
-        let png=base64::engine::general_purpose::STANDARD.encode(include_bytes!("fixtures/privacy.png"));
-        let runner=mock_runner(move |request,_|Some((Duration::ZERO,if request.starts_with("POST /session ") {
-            json!({"value":{"sessionId":"SESSION"}}).to_string()
-        } else if request.contains("/screenshot") {json!({"value":png}).to_string()} else {json!({"value":null}).to_string()})));
-        let state=build_state_with_runner(runner.url());
-        let response=server::http::router(state.clone()).oneshot(Request::builder().uri("/agent/screenshot?raw=1").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(response.status(),StatusCode::OK);
+        let png = base64::engine::general_purpose::STANDARD
+            .encode(include_bytes!("fixtures/privacy.png"));
+        let runner = mock_runner(move |request, _| {
+            Some((
+                Duration::ZERO,
+                if request.starts_with("POST /session ") {
+                    json!({"value":{"sessionId":"SESSION"}}).to_string()
+                } else if request.contains("/screenshot") {
+                    json!({"value":png}).to_string()
+                } else {
+                    json!({"value":null}).to_string()
+                },
+            ))
+        });
+        let state = build_state_with_runner(runner.url());
+        let response = server::http::router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/screenshot?raw=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         // Headers/response already exist, but no body bytes have been committed.
-        hold(state.clone(),true).await;hold(state.clone(),false).await;
-        assert!(response.into_body().collect().await.is_err(),"queued PNG bytes must be discarded, not published after unhide");
+        hold(state.clone(), true).await;
+        hold(state.clone(), false).await;
+        assert!(
+            response.into_body().collect().await.is_err(),
+            "queued PNG bytes must be discarded, not published after unhide"
+        );
     });
 }
 
 #[test]
 fn a_private_hold_cancels_a_stalled_capture_without_waiting_for_the_runner() {
     block(async {
-        let started=Arc::new(tokio::sync::Notify::new());let signal=started.clone();
-        let runner=mock_runner(move |request,_| {
-            if request.starts_with("POST /session "){return Some((Duration::ZERO,json!({"value":{"sessionId":"SESSION"}}).to_string()));}
-            if request.contains("/screenshot"){signal.notify_one();return Some((Duration::from_secs(5),json!({"value":""}).to_string()));}
-            Some((Duration::ZERO,json!({"value":null}).to_string()))
+        let started = Arc::new(tokio::sync::Notify::new());
+        let signal = started.clone();
+        let runner = mock_runner(move |request, _| {
+            if request.starts_with("POST /session ") {
+                return Some((
+                    Duration::ZERO,
+                    json!({"value":{"sessionId":"SESSION"}}).to_string(),
+                ));
+            }
+            if request.contains("/screenshot") {
+                signal.notify_one();
+                return Some((Duration::from_secs(5), json!({"value":""}).to_string()));
+            }
+            Some((Duration::ZERO, json!({"value":null}).to_string()))
         });
-        let state=build_state_with_runner(runner.url());let app=server::http::router(state.clone());
-        let pending=tokio::spawn(async move {app.oneshot(Request::builder().uri("/agent/screenshot?raw=1").body(Body::empty()).unwrap()).await.unwrap()});
-        tokio::time::timeout(Duration::from_secs(3),started.notified()).await.unwrap();
-        hold(state,true).await;
-        let response=tokio::time::timeout(Duration::from_secs(2),pending).await.expect("private capture must not wait for the stalled runner").unwrap();
-        assert_eq!(response.status(),StatusCode::LOCKED);
+        let state = build_state_with_runner(runner.url());
+        let app = server::http::router(state.clone());
+        let pending = tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .uri("/agent/screenshot?raw=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(3), started.notified())
+            .await
+            .unwrap();
+        hold(state, true).await;
+        let response = tokio::time::timeout(Duration::from_secs(2), pending)
+            .await
+            .expect("private capture must not wait for the stalled runner")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::LOCKED);
+    });
+}
+
+#[test]
+fn normalizing_an_expired_hold_preserves_a_new_permitted_capture() {
+    block(async {
+        let png = base64::engine::general_purpose::STANDARD
+            .encode(include_bytes!("fixtures/privacy.png"));
+        let runner = mock_runner(move |request, _| {
+            Some((
+                Duration::ZERO,
+                if request.starts_with("POST /session ") {
+                    json!({"value":{"sessionId":"SESSION"}}).to_string()
+                } else if request.contains("/screenshot") {
+                    json!({"value":png}).to_string()
+                } else {
+                    json!({"value":null}).to_string()
+                },
+            ))
+        });
+        let state = build_state_with_runner(runner.url());
+        *state.private_until.lock().unwrap() =
+            Some(std::time::Instant::now() - Duration::from_secs(1));
+        let response = server::http::router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/agent/screenshot?raw=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        hold(state, false).await;
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), include_bytes!("fixtures/privacy.png"));
     });
 }

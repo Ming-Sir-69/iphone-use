@@ -72,6 +72,7 @@
 
   /* ── i18n: English is the source; Chinese follows the viewer's browser. ── */
   const I18N_ZH = {
+    "Waiting for a new permitted frame.": "正在等待允许显示的新画面。",
     "iPhone screen": "iPhone 屏幕",
     "connecting…": "正在连接…",
     "waiting for the first frame…": "正在等待第一帧画面…",
@@ -251,11 +252,13 @@
       const step = (ZH && body.next_step_zh) || body.next_step || body.hint;
       if (step) text += " — " + step;
     }
-    if (body.private_secs) {
+    if (body.private_secs || body.clear_frame) {
       setStatus("warn", describe(body));
       image.hidden = true;
       image.removeAttribute("src");
-      empty.textContent = t("Someone is signing in on the phone. The screen stays hidden until the agent continues.");
+      empty.textContent = body.private_secs
+        ? t("Someone is signing in on the phone. The screen stays hidden until the agent continues.")
+        : t("Waiting for a new permitted frame.");
       empty.hidden = false;
       return false;
     }

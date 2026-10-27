@@ -286,6 +286,37 @@ fn content_length(headers: &[u8]) -> Option<usize> {
 /// reload does not tear down and rebuild the encoder.
 const IDLE_LINGER: Duration = Duration::from_secs(10);
 
+#[derive(Default)]
+struct VideoPrivacy {
+    until: Option<std::time::Instant>,
+    generation: u64,
+    viewers: Arc<AtomicUsize>,
+}
+
+impl VideoPrivacy {
+    fn permits(&self, generation: u64) -> bool {
+        self.generation == generation && self.until.is_none_or(|until| until <= std::time::Instant::now())
+    }
+}
+
+/// The asynchronous VideoToolbox callback retains this fence, so a queued
+/// encoded frame cannot outlive a private on/off transition and reach a new viewer.
+#[derive(Clone)]
+struct FrameSink {
+    tx: tokio::sync::broadcast::Sender<H264Frame>,
+    privacy: Arc<Mutex<VideoPrivacy>>,
+    generation: u64,
+}
+
+impl FrameSink {
+    fn send(&self, frame: H264Frame) -> bool {
+        let privacy = self.privacy.lock().unwrap_or_else(|e| e.into_inner());
+        if !privacy.permits(self.generation) { return false; }
+        let _ = self.tx.send(frame);
+        true
+    }
+}
+
 pub struct VideoHub {
     mjpeg_url: String,
     tx: tokio::sync::broadcast::Sender<H264Frame>,
@@ -315,13 +346,14 @@ pub struct VideoHub {
     /// The newest upstream JPEG and when it arrived, while the pipeline runs.
     latest_jpeg: Mutex<Option<(Bytes, std::time::Instant)>>,
     /// The screen is private until then (see [`VideoHub::hide_until`]).
-    hidden_until: Mutex<Option<std::time::Instant>>,
+    privacy: Arc<Mutex<VideoPrivacy>>,
 }
 
 /// Keeps a subscription counted; dropping it lets the pipeline wind down.
 pub struct Subscription {
     pub frames: tokio::sync::broadcast::Receiver<H264Frame>,
     subscribers: Arc<AtomicUsize>,
+    privacy_viewers: Arc<AtomicUsize>,
     quality: Option<Arc<AtomicUsize>>,
 }
 
@@ -331,6 +363,7 @@ impl Drop for Subscription {
             quality.fetch_sub(1, Ordering::AcqRel);
         }
         self.subscribers.fetch_sub(1, Ordering::AcqRel);
+        self.privacy_viewers.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -358,7 +391,7 @@ impl VideoHub {
             verdict_at: Mutex::new(None),
             verdict_running: AtomicBool::new(false),
             latest_jpeg: Mutex::new(None),
-            hidden_until: Mutex::new(None),
+            privacy: Arc::new(Mutex::new(VideoPrivacy::default())),
         })
     }
 
@@ -413,6 +446,8 @@ impl VideoHub {
         {
             return None;
         }
+        let privacy = self.privacy.lock().unwrap_or_else(|e| e.into_inner());
+        if !privacy.permits(privacy.generation) { return None; }
         let latest = self.latest_jpeg.lock().unwrap_or_else(|e| e.into_inner());
         let (jpeg, at) = latest.as_ref()?;
         let after_action = not_before.is_none_or(|sent| *at > sent + STREAM_LAG);
@@ -444,6 +479,15 @@ impl VideoHub {
 
     /// Subscribe to the encoded stream, starting the pipeline if needed.
     pub fn subscribe(self: &Arc<Self>, mode: VideoMode) -> Subscription {
+        let (privacy_viewers, visible) = {
+            let privacy = self.privacy.lock().unwrap_or_else(|e| e.into_inner());
+            let visible = privacy.permits(privacy.generation);
+            // A subscription refused while private never becomes authority
+            // merely because the deadline later expires.
+            let viewers = if visible {privacy.viewers.clone()} else {Arc::new(AtomicUsize::new(0))};
+            viewers.fetch_add(1, Ordering::AcqRel);
+            (viewers, visible)
+        };
         let frames = self.tx.subscribe();
         let quality = (mode == VideoMode::Quality).then(|| {
             self.quality_subscribers.fetch_add(1, Ordering::AcqRel);
@@ -454,7 +498,7 @@ impl VideoHub {
         self.force_idr.store(true, Ordering::Release);
         self.wake.notify_one();
         let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
-        if !*running {
+        if !*running && visible {
             *running = true;
             let hub = Arc::clone(self);
             tokio::spawn(async move {
@@ -469,6 +513,7 @@ impl VideoHub {
         Subscription {
             frames,
             subscribers: Arc::clone(&self.subscribers),
+            privacy_viewers,
             quality,
         }
     }
@@ -484,22 +529,34 @@ impl VideoHub {
     }
 
     async fn run(self: Arc<Self>) -> anyhow::Result<()> {
-        let result = self.pipeline().await;
-        if result.is_err() {
-            // Failed before it could decide to stop on its own.
-            self.mark_stopped();
+        loop {
+            let generation = self.privacy_generation();
+            let result = self.pipeline(generation).await;
+            if result.is_err() { self.mark_stopped(); }
+            // A viewer may arrive after the hold is lifted but before this old
+            // producer has drained. Restart once, under the same running gate;
+            // do not leave that viewer waiting for the inactivity timeout.
+            if self.privacy_generation() != generation && self.current_privacy_has_viewers() {
+                let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+                if !*running {
+                    *running = true;
+                    drop(running);
+                    continue;
+                }
+            }
+            return result;
         }
-        result
     }
 
     fn mark_stopped(&self) {
-        *self.running.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        *running = false;
         *self.latest_jpeg.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // No picture any more: nothing is blank, nothing is redacted.
         self.frame_blank.store(false, Ordering::Release);
     }
 
-    async fn pipeline(&self) -> anyhow::Result<()> {
+    async fn pipeline(&self, generation: u64) -> anyhow::Result<()> {
         // The device runner encodes H.264 itself: pass that through and skip
         // the MJPEG decode + Mac re-encode. WebDriverAgent and older runners
         // answer `/h264` with their MJPEG stream; those take the transcode
@@ -507,33 +564,34 @@ impl VideoHub {
         if passthrough_enabled() {
             let mut idle_since: Option<std::time::Instant> = None;
             loop {
-                match self.passthrough(&mut idle_since).await {
-                    Passthrough::Stopped => {
-                        self.frame_blank.store(false, Ordering::Release);
-                        return Ok(());
-                    }
+                match self.passthrough_in_epoch(&mut idle_since, generation).await {
+                    Passthrough::Stopped => return Ok(()),
                     Passthrough::Unsupported => break,
                     // A viewer switched modes, or the mode yielded no frame:
                     // reconnect at once with the (new) effective one.
                     Passthrough::ModeChanged | Passthrough::NoFrames => {}
                     Passthrough::Lost => {
                         tokio::time::sleep(Duration::from_millis(500)).await;
-                        if self.should_stop(&mut idle_since) {
-                            self.frame_blank.store(false, Ordering::Release);
-                            return Ok(());
-                        }
+                        if self.should_stop_in_epoch(&mut idle_since, generation) { return Ok(()); }
                     }
                 }
             }
         }
-        self.transcode().await
+        self.transcode(generation).await
     }
 
     /// Relay the runner's own H.264 (`GET /h264` on its MJPEG port, framed
     /// exactly like `/agent/h264`) until nobody watches or the stream ends.
+    #[cfg(test)]
     async fn passthrough(&self, idle_since: &mut Option<std::time::Instant>) -> Passthrough {
+        self.passthrough_in_epoch(idle_since, self.privacy_generation()).await
+    }
+
+    async fn passthrough_in_epoch(&self, idle_since: &mut Option<std::time::Instant>, generation: u64) -> Passthrough {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+        if self.should_stop_in_epoch(idle_since, generation) { return Passthrough::Stopped; }
+        let sink = self.frame_sink(generation);
         let Some((host, port)) = reqwest::Url::parse(&self.mjpeg_url)
             .ok()
             .and_then(|url| Some((url.host_str()?.to_string(), url.port_or_known_default()?)))
@@ -548,6 +606,7 @@ impl VideoHub {
         let Ok(Ok(mut stream)) = connect else {
             return Passthrough::Lost;
         };
+        if self.should_stop_in_epoch(idle_since, generation) { return Passthrough::Stopped; }
         let _ = stream.set_nodelay(true);
         let mode = self.effective_mode();
         let target = format!("/h264?{}", mode.runner_query(self.bitrate / 1000));
@@ -602,7 +661,7 @@ impl VideoHub {
         loop {
             while let Some((frame, blank)) = take_message(&mut buf) {
                 self.frame_blank.store(blank, Ordering::Release);
-                let _ = self.tx.send(low_delay(frame));
+                if !sink.send(low_delay(frame)) { self.mark_stopped(); return Passthrough::Stopped; }
                 if !streamed {
                     streamed = true;
                     self.mode_failures
@@ -611,7 +670,7 @@ impl VideoHub {
                         .mark_ok(mode);
                 }
             }
-            if self.should_stop(idle_since) {
+            if self.should_stop_in_epoch(idle_since, generation) {
                 return Passthrough::Stopped;
             }
             if !streamed && connected_at.elapsed() >= FIRST_FRAME_TIMEOUT {
@@ -672,7 +731,7 @@ impl VideoHub {
 
     /// The MJPEG → H.264 path: decode each upstream JPEG and encode it on the
     /// Mac.
-    async fn transcode(&self) -> anyhow::Result<()> {
+    async fn transcode(&self, generation: u64) -> anyhow::Result<()> {
         use futures_util::StreamExt;
 
         // Latest-wins handoff to the encoder thread: a slow encode drops stale
@@ -683,7 +742,7 @@ impl VideoHub {
         let encoder_thread = {
             let slot = Arc::clone(&slot);
             let stop = Arc::clone(&stop);
-            let tx = self.tx.clone();
+            let tx = self.frame_sink(generation);
             let force_idr = Arc::clone(&self.force_idr);
             let frame_blank = Arc::clone(&self.frame_blank);
             let bitrate = self.effective_mode().transcode_bitrate(self.bitrate);
@@ -697,6 +756,7 @@ impl VideoHub {
             .build()?;
         let mut idle_since: Option<std::time::Instant> = None;
         'outer: loop {
+            if self.should_stop_in_epoch(&mut idle_since, generation) { break; }
             if encoder_thread.is_finished() {
                 // The encoder could not start (or died): stop, so the next
                 // subscriber starts a fresh pipeline instead of feeding a
@@ -727,7 +787,7 @@ impl VideoHub {
                         Err(_) => tracing::debug!("h264: MJPEG upstream sent no headers in 5 s"),
                     }
                     tokio::time::sleep(Duration::from_secs(1)).await;
-                    if self.should_stop(&mut idle_since) {
+                    if self.should_stop_in_epoch(&mut idle_since, generation) {
                         break;
                     }
                     continue;
@@ -737,7 +797,7 @@ impl VideoHub {
             let mut splitter = MjpegSplitter::new();
             loop {
                 let next = tokio::time::timeout(Duration::from_secs(1), body.next()).await;
-                if self.should_stop(&mut idle_since) {
+                if self.should_stop_in_epoch(&mut idle_since, generation) {
                     break 'outer;
                 }
                 if encoder_thread.is_finished() {
@@ -749,8 +809,10 @@ impl VideoHub {
                     Err(_) => continue,                   // a static screen sends slowly
                 };
                 if let Some(jpeg) = splitter.push(&chunk).pop() {
-                    *self.latest_jpeg.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some((jpeg.clone(), std::time::Instant::now()));
+                    if !self.remember_live_jpeg(generation, jpeg.clone()) {
+                        self.mark_stopped();
+                        break 'outer;
+                    }
                     let (lock, ready) = &*slot;
                     *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(jpeg);
                     ready.notify_one();
@@ -773,27 +835,55 @@ impl VideoHub {
     /// newest frame so a screenshot taken later cannot be served from it.
     /// `None` lifts it early.
     pub fn hide_until(&self, until: Option<std::time::Instant>) {
-        *self.hidden_until.lock().unwrap_or_else(|e| e.into_inner()) = until;
-        if until.is_some() {
+        let mut privacy = self.privacy.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        let was_private = privacy.until.is_some_and(|deadline| deadline > now);
+        let will_be_private = until.is_some_and(|deadline| deadline > now);
+        let changed = privacy.until != until && (was_private || will_be_private);
+        privacy.until = until;
+        if changed {
+            privacy.generation = privacy.generation.wrapping_add(1);
+            privacy.viewers = Arc::new(AtomicUsize::new(0));
             *self.latest_jpeg.lock().unwrap_or_else(|e| e.into_inner()) = None;
             self.wake.notify_one();
         }
     }
 
-    fn hidden(&self) -> bool {
-        self.hidden_until
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some_and(|until| until > std::time::Instant::now())
+    fn privacy_generation(&self) -> u64 {
+        self.privacy.lock().unwrap_or_else(|e| e.into_inner()).generation
     }
 
+    fn current_privacy_has_viewers(&self) -> bool {
+        let privacy = self.privacy.lock().unwrap_or_else(|e| e.into_inner());
+        privacy.permits(privacy.generation) && privacy.viewers.load(Ordering::Acquire) > 0
+    }
+
+    fn frame_sink(&self, generation: u64) -> FrameSink {
+        FrameSink { tx:self.tx.clone(), privacy:self.privacy.clone(), generation }
+    }
+
+    fn remember_live_jpeg(&self, generation: u64, jpeg: Bytes) -> bool {
+        let privacy = self.privacy.lock().unwrap_or_else(|e| e.into_inner());
+        if !privacy.permits(generation) { return false; }
+        *self.latest_jpeg.lock().unwrap_or_else(|e| e.into_inner()) = Some((jpeg, std::time::Instant::now()));
+        true
+    }
+
+    #[cfg(test)]
     fn should_stop(&self, idle_since: &mut Option<std::time::Instant>) -> bool {
-        if self.hidden() {
-            *self.running.lock().unwrap_or_else(|e| e.into_inner()) = false;
-            *self.latest_jpeg.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.should_stop_in_epoch(idle_since, self.privacy_generation())
+    }
+
+    fn should_stop_in_epoch(&self, idle_since: &mut Option<std::time::Instant>, generation: u64) -> bool {
+        let (permitted, viewers) = {
+            let privacy = self.privacy.lock().unwrap_or_else(|e| e.into_inner());
+            (privacy.permits(generation), privacy.viewers.load(Ordering::Acquire))
+        };
+        if !permitted {
+            self.mark_stopped();
             return true;
         }
-        if self.subscribers.load(Ordering::Acquire) > 0 {
+        if viewers > 0 {
             *idle_since = None;
             return false;
         }
@@ -802,11 +892,13 @@ impl VideoHub {
             return false;
         }
         let mut running = self.running.lock().unwrap_or_else(|e| e.into_inner());
-        if self.subscribers.load(Ordering::Acquire) > 0 {
+        let privacy = self.privacy.lock().unwrap_or_else(|e| e.into_inner());
+        if privacy.permits(generation) && privacy.viewers.load(Ordering::Acquire) > 0 {
             *idle_since = None;
             return false;
         }
         *running = false;
+        self.frame_blank.store(false, Ordering::Release);
         true
     }
 }
@@ -865,7 +957,7 @@ fn take_message(buf: &mut Vec<u8>) -> Option<(H264Frame, bool)> {
 fn encoder_loop(
     slot: Arc<(Mutex<Option<Bytes>>, std::sync::Condvar)>,
     stop: Arc<AtomicBool>,
-    tx: tokio::sync::broadcast::Sender<H264Frame>,
+    tx: FrameSink,
     force_idr: Arc<AtomicBool>,
     frame_blank: Arc<AtomicBool>,
     bitrate: u32,
@@ -940,7 +1032,7 @@ fn decode_bgra(jpeg: &[u8], out: &mut Vec<u8>) -> Result<(usize, usize), String>
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
-    use super::H264Frame;
+    use super::FrameSink;
 
     pub struct Encoder;
 
@@ -949,7 +1041,7 @@ mod imp {
             _width: usize,
             _height: usize,
             _bitrate: u32,
-            _tx: tokio::sync::broadcast::Sender<H264Frame>,
+            _tx: FrameSink,
         ) -> anyhow::Result<Self> {
             anyhow::bail!("H.264 encoding needs VideoToolbox (macOS)")
         }
@@ -966,7 +1058,7 @@ mod imp {
     //! callback and Annex-B conversion follow the encoder the iPhone
     //! Mirroring backend shipped with (hardware-validated), minus the capture.
 
-    use super::H264Frame;
+    use super::{FrameSink, H264Frame};
     use std::ffi::c_void;
     use std::ptr::NonNull;
 
@@ -993,7 +1085,7 @@ mod imp {
     };
 
     struct Context {
-        tx: tokio::sync::broadcast::Sender<H264Frame>,
+        tx: FrameSink,
     }
 
     pub struct Encoder {
@@ -1012,7 +1104,7 @@ mod imp {
             width: usize,
             height: usize,
             bitrate: u32,
-            tx: tokio::sync::broadcast::Sender<H264Frame>,
+            tx: FrameSink,
         ) -> anyhow::Result<Self> {
             let context = Box::into_raw(Box::new(Context { tx }));
             let mut out: *mut VTCompressionSession = std::ptr::null_mut();
@@ -1382,6 +1474,7 @@ mod tests {
         // Nobody watching, nothing blank: no check is due.
         assert!(!hub.begin_verdict(Duration::ZERO));
         hub.subscribers.store(1, Ordering::Release);
+        hub.privacy.lock().unwrap().viewers.store(1, Ordering::Release);
         assert!(
             !hub.begin_verdict(Duration::ZERO),
             "a live picture needs no verdict"
@@ -1427,6 +1520,7 @@ mod tests {
         let hub = VideoHub::new("http://127.0.0.1:1".into());
         *hub.running.lock().unwrap() = true;
         hub.subscribers.store(1, Ordering::Release);
+        hub.privacy.lock().unwrap().viewers.store(1, Ordering::Release);
         *hub.latest_jpeg.lock().unwrap() = Some((Bytes::from_static(JPEG_A), std::time::Instant::now()));
 
         hub.hide_until(Some(std::time::Instant::now() + Duration::from_secs(60)));
@@ -1435,12 +1529,14 @@ mod tests {
         assert!(hub.should_stop(&mut idle), "no linger while private");
         assert!(!*hub.running.lock().unwrap());
 
-        // Lifted (or expired): viewers keep it running again.
+        // Old viewers cannot restart a producer after unhide. A new viewer
+        // after an expired private hold may capture again.
         hub.hide_until(None);
-        *hub.running.lock().unwrap() = true;
-        assert!(!hub.should_stop(&mut idle));
+        assert!(!hub.current_privacy_has_viewers());
         hub.hide_until(Some(std::time::Instant::now() - Duration::from_secs(1)));
-        assert!(!hub.should_stop(&mut idle), "an expired private hold no longer stops it");
+        hub.privacy.lock().unwrap().viewers.store(1, Ordering::Release);
+        *hub.running.lock().unwrap() = true;
+        assert!(!hub.should_stop(&mut idle), "an expired private hold allows fresh viewers");
     }
 
     #[test]
@@ -1452,6 +1548,7 @@ mod tests {
         // A viewer counted before the decision keeps the pipeline running
         // and resets the idle clock.
         hub.subscribers.store(1, Ordering::Release);
+        hub.privacy.lock().unwrap().viewers.store(1, Ordering::Release);
         let mut idle = Some(long_ago);
         assert!(!hub.should_stop(&mut idle));
         assert!(idle.is_none());
@@ -1460,6 +1557,7 @@ mod tests {
         // Nobody watching past the linger: stop, and the mark is already
         // down when should_stop returns, so the next subscribe starts afresh.
         hub.subscribers.store(0, Ordering::Release);
+        hub.privacy.lock().unwrap().viewers.store(0, Ordering::Release);
         let mut idle = Some(long_ago);
         assert!(hub.should_stop(&mut idle));
         assert!(!*hub.running.lock().unwrap());
@@ -1636,6 +1734,7 @@ mod tests {
         .await;
         let hub = VideoHub::new(url);
         hub.subscribers.store(1, Ordering::Release);
+        hub.privacy.lock().unwrap().viewers.store(1, Ordering::Release);
         let mut frames = hub.tx.subscribe();
         hub.force_idr.store(true, Ordering::Release);
         let run = {
@@ -1696,12 +1795,14 @@ mod tests {
         let quality = Subscription {
             frames: hub.tx.subscribe(),
             subscribers: Arc::clone(&hub.subscribers),
+            privacy_viewers: Arc::new(AtomicUsize::new(1)),
             quality: Some(Arc::clone(&hub.quality_subscribers)),
         };
         hub.subscribers.fetch_add(1, Ordering::AcqRel);
         let performance = Subscription {
             frames: hub.tx.subscribe(),
             subscribers: Arc::clone(&hub.subscribers),
+            privacy_viewers: Arc::new(AtomicUsize::new(1)),
             quality: None,
         };
         assert_eq!(hub.effective_mode(), VideoMode::Quality);
@@ -1725,6 +1826,7 @@ mod tests {
         .await;
         let hub = VideoHub::new(url);
         hub.subscribers.store(1, Ordering::Release);
+        hub.privacy.lock().unwrap().viewers.store(1, Ordering::Release);
         hub.quality_subscribers.store(1, Ordering::Release);
         let mut frames = hub.tx.subscribe();
         let run = {
@@ -1783,6 +1885,7 @@ mod tests {
         .await;
         let hub = VideoHub::new(url);
         hub.subscribers.store(1, Ordering::Release);
+        hub.privacy.lock().unwrap().viewers.store(1, Ordering::Release);
         let mut idle = None;
         assert!(matches!(
             hub.passthrough(&mut idle).await,
@@ -1882,6 +1985,7 @@ mod tests {
         });
         let hub = VideoHub::new(url);
         hub.subscribers.store(1, Ordering::Release);
+        hub.privacy.lock().unwrap().viewers.store(1, Ordering::Release);
         hub.quality_subscribers.store(1, Ordering::Release);
         assert_eq!(hub.effective_mode(), VideoMode::Quality);
         let mut idle = None;
@@ -1909,7 +2013,137 @@ mod tests {
         assert!(frame.keyframe);
         assert!(lines.recv().await.unwrap().contains("mode=performance"));
         hub.subscribers.store(0, Ordering::Release);
+        hub.privacy.lock().unwrap().viewers.store(0, Ordering::Release);
         hub.quality_subscribers.store(0, Ordering::Release);
         run.abort();
     }
+    #[test]
+    fn queued_encoded_frames_and_jpeg_cache_cannot_cross_a_private_on_off_transition() {
+        let hub = VideoHub::new("http://127.0.0.1:1".into());
+        let mut frames = hub.tx.subscribe();
+        let generation = hub.privacy_generation();
+        let old_callback = hub.frame_sink(generation);
+        let frame = H264Frame {data:Bytes::from_static(&[0,0,0,1,0x65,1]), keyframe:true, pts_micros:1};
+        assert!(old_callback.send(frame.clone()));
+        assert_eq!(frames.try_recv().unwrap().pts_micros,1);
+        assert!(hub.remember_live_jpeg(generation,Bytes::from_static(JPEG_A)));
+        hub.hide_until(Some(std::time::Instant::now()+Duration::from_secs(60)));
+        hub.hide_until(None);
+        assert!(!old_callback.send(frame.clone()),"a late VideoToolbox callback must stay fenced after unhide");
+        assert!(!hub.remember_live_jpeg(generation,Bytes::from_static(JPEG_A)));
+        assert!(hub.latest_jpeg.lock().unwrap().is_none());
+        assert!(frames.try_recv().is_err());
+        assert!(hub.frame_sink(hub.privacy_generation()).send(frame));
+        assert_eq!(frames.try_recv().unwrap().pts_micros,1);
+        assert!(hub.remember_live_jpeg(hub.privacy_generation(),Bytes::from_static(JPEG_B)));
+    }
+
+    #[test]
+    fn private_on_off_keeps_old_subscribers_from_restarting_capture() {
+        let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let hub=VideoHub::new("http://127.0.0.1:1".into());
+            // Avoid starting networking: only subscription accounting is under test.
+            *hub.running.lock().unwrap()=true;
+            let old=hub.subscribe(VideoMode::Performance);
+            let generation=hub.privacy_generation();
+            assert!(hub.current_privacy_has_viewers());
+            hub.hide_until(Some(std::time::Instant::now()+Duration::from_secs(60)));
+            hub.hide_until(None);
+            assert!(!hub.current_privacy_has_viewers(),"stale subscriptions cannot authorize new capture");
+            assert!(hub.should_stop_in_epoch(&mut None,generation));
+            *hub.running.lock().unwrap()=true;
+            let fresh=hub.subscribe(VideoMode::Performance);
+            assert!(hub.current_privacy_has_viewers());
+            drop(fresh);
+            assert!(!hub.current_privacy_has_viewers());
+            assert_eq!(hub.subscriber_count(),1);
+            let mut idle=Some(std::time::Instant::now()-IDLE_LINGER-Duration::from_secs(1));
+            assert!(hub.should_stop_in_epoch(&mut idle,hub.privacy_generation()),"stale subscriptions cannot extend capture linger");
+            *hub.running.lock().unwrap()=true;
+            let fresh=hub.subscribe(VideoMode::Performance);
+            drop(old);
+            assert!(hub.current_privacy_has_viewers(),"dropping an old subscription must not subtract a fresh one");
+            drop(fresh);
+            assert!(!hub.current_privacy_has_viewers());
+        });
+    }
+
+    #[test]
+    fn a_new_viewer_after_unhide_restarts_only_after_the_old_producer_drains() {
+        block_on(async {
+            use tokio::io::{AsyncReadExt,AsyncWriteExt};
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address=listener.local_addr().unwrap();
+            let (started_tx,started_rx)=tokio::sync::oneshot::channel();
+            let (release_tx,release_rx)=tokio::sync::oneshot::channel();
+            let source=tokio::spawn(async move {
+                let (mut old,_)=listener.accept().await.unwrap();
+                let mut request=[0u8;4096];let _=old.read(&mut request).await;
+                let _=started_tx.send(());let _=release_rx.await;
+                let head=b"HTTP/1.0 200 OK\r\nX-Video-Format: iphone-use-h264-annexb-v1\r\n\r\n";
+                let _=old.write_all(head).await;
+                let _=old.write_all(&runner_message(FLAG_KEYFRAME,1,&[0,0,0,1,0x65,1])).await;
+                let (mut fresh,_)=listener.accept().await.unwrap();
+                let _=fresh.read(&mut request).await;
+                fresh.write_all(head).await.unwrap();
+                fresh.write_all(&runner_message(FLAG_KEYFRAME,2,&[0,0,0,1,0x65,2])).await.unwrap();
+                let _=fresh.read(&mut request).await;
+            });
+            let hub=VideoHub::new(format!("http://{address}"));
+            let old=hub.subscribe(VideoMode::Performance);
+            tokio::time::timeout(Duration::from_secs(3),started_rx).await.unwrap().unwrap();
+            hub.hide_until(Some(std::time::Instant::now()+Duration::from_secs(60)));
+            hub.hide_until(None);
+            let mut fresh=hub.subscribe(VideoMode::Performance);
+            drop(old);
+            let _=release_tx.send(());
+            let frame=tokio::time::timeout(Duration::from_secs(4),fresh.frames.recv()).await.unwrap().unwrap();
+            assert_eq!(frame.pts_micros,2,"the previous producer must never forward its delayed frame to the fresh viewer");
+            drop(fresh);
+            hub.hide_until(Some(std::time::Instant::now()+Duration::from_secs(60)));
+            source.abort();
+        });
+    }
+
+    #[test]
+    fn expired_privacy_normalization_preserves_newer_video_subscribers() {
+        block_on(async {
+            let hub=VideoHub::new("http://127.0.0.1:1".into());
+            let before=hub.frame_sink(hub.privacy_generation());
+            hub.hide_until(Some(std::time::Instant::now()+Duration::from_secs(60)));
+            // Model time passing without another policy operation. The HTTP
+            // and Simulator checks separately exercise real deadline expiry.
+            hub.privacy.lock().unwrap().until=Some(std::time::Instant::now()-Duration::from_secs(1));
+            let generation=hub.privacy_generation();
+            *hub.running.lock().unwrap()=true;
+            let mut fresh=hub.subscribe(VideoMode::Performance);
+            let after=hub.frame_sink(generation);
+            assert!(hub.remember_live_jpeg(generation,Bytes::from_static(JPEG_A)));
+            hub.hide_until(None);
+            assert_eq!(hub.privacy_generation(),generation,"clearing an expired deadline is not a new private transition");
+            assert!(hub.current_privacy_has_viewers());
+            assert!(hub.live_frame(None).is_some());
+            let frame=H264Frame{data:Bytes::from_static(&[0,0,0,1,0x65]),keyframe:true,pts_micros:1};
+            assert!(!before.send(frame.clone()),"pre-private work must remain revoked");
+            assert!(after.send(frame));
+            assert_eq!(fresh.frames.try_recv().unwrap().pts_micros,1);
+        });
+    }
+
+    #[test]
+    fn subscriptions_admitted_while_private_cannot_revive_after_expiry() {
+        block_on(async {
+            let hub=VideoHub::new("http://127.0.0.1:1".into());
+            hub.hide_until(Some(std::time::Instant::now()+Duration::from_secs(60)));
+            let refused=hub.subscribe(VideoMode::Performance);
+            hub.privacy.lock().unwrap().until=Some(std::time::Instant::now()-Duration::from_secs(1));
+            assert!(!hub.current_privacy_has_viewers(),"a private subscription is not newly authorized by expiry");
+            assert!(!*hub.running.lock().unwrap());
+            hub.hide_until(None);
+            assert!(!hub.current_privacy_has_viewers());
+            drop(refused);
+        });
+    }
+
 }

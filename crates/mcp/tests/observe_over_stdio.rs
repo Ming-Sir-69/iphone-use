@@ -52,11 +52,12 @@ impl ScriptedDaemon {
                         let mut buffer = [0_u8; 8_192];
                         let count = stream.read(&mut buffer).unwrap_or(0);
                         let status_read = buffer[..count].starts_with(b"GET /agent/status ");
-                        let response_status = if status_read && status_body.is_some() { "200 OK" } else { status };
+                        let truncated = status == "200 Truncated" && !status_read;
+                        let response_status = if status_read && status_body.is_some() || truncated { "200 OK" } else { status };
                         let body = if status_read { status_body.as_ref().unwrap_or(&body) } else { &body };
                         let head = format!(
                             "HTTP/1.1 {response_status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
+                            body.len() + if truncated {64} else {0}
                         );
                         let _ = stream.write_all(head.as_bytes());
                         let _ = stream.write_all(&body);
@@ -518,7 +519,7 @@ fn capabilities_reach_the_client_as_structured_content() {
 
 #[test]
 fn failed_capture_clears_old_pixels_despite_racing_open_status() {
-    for status in ["423 Locked", "503 Service Unavailable"] {
+    for status in ["423 Locked", "503 Service Unavailable", "200 Truncated"] {
         let daemon = ScriptedDaemon::routed(status, br#"{"ok":false,"error":"capture_refused"}"#.to_vec(),
             Some(br#"{"ok":true,"drivable":true,"screen_private_secs":0}"#.to_vec()));
         let mut child = McpChild::start_with(&daemon.url, "off");
