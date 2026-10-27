@@ -74,6 +74,7 @@ to `install.html`.
 From `site/`:
 
 ```bash
+python3 _tools/seo.py --check && \
 WA_PASSTHROUGH=1 CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=3d050f54dac3fb90c344e3889ec45792 npx wrangler@4 deploy
 ```
 

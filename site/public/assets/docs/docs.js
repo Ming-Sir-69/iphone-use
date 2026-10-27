@@ -7,6 +7,8 @@
    No ads, no account chip, no PostHog on this site.
    ========================================================================== */
 (function () {
+  // Preview builds must not count as production visits.
+  if (location.hostname.toLowerCase() !== 'iphone-use.leeguoo.com') return;
   var head = document.head || document.getElementsByTagName('head')[0];
   if (!head) return;
 
