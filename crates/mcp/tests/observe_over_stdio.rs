@@ -24,6 +24,7 @@ struct ScriptedDaemon {
     url: String,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl ScriptedDaemon {
@@ -37,6 +38,8 @@ impl ScriptedDaemon {
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
         let thread = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(60);
             while !thread_stop.load(Ordering::Acquire) && Instant::now() < deadline {
@@ -58,6 +61,8 @@ impl ScriptedDaemon {
                                 Ok(count) => request.extend_from_slice(&buffer[..count]),
                             }
                         }
+                        let line_end = request.windows(2).position(|bytes| bytes == b"\r\n").unwrap_or(request.len());
+                        seen.lock().unwrap().push(String::from_utf8_lossy(&request[..line_end]).into_owned());
                         let status_read = request.windows(2).any(|bytes| bytes == b"\r\n")
                             && request.starts_with(b"GET /agent/status ");
                         let truncated = status == "200 Truncated" && !status_read;
@@ -81,6 +86,7 @@ impl ScriptedDaemon {
             url: format!("http://{address}"),
             stop,
             thread: Some(thread),
+            requests,
         }
     }
 }
@@ -117,7 +123,12 @@ impl McpChild {
     }
 
     fn start_with(daemon_url: &str, structured: &str) -> Self {
+        Self::start_options(daemon_url, structured, &[])
+    }
+
+    fn start_options(daemon_url: &str, structured: &str, extra: &[(&str, &str)]) -> Self {
         let mut child = Command::new(binary())
+            .envs(extra.iter().copied())
             .env("IPHONE_USE_URL", daemon_url)
             .env("IPHONE_USE_MCP_STRUCTURED", structured)
             .env_remove("IPHONE_USE_TOKEN")
@@ -537,5 +548,28 @@ fn failed_capture_clears_old_pixels_despite_racing_open_status() {
         assert!(body["private_secs"].is_null());
         assert!(body["frame"].is_null());
         assert_eq!(body["clear_frame"], true, "{body}");
+    }
+}
+
+#[test]
+fn registry_without_flows_does_not_query_phone_inventory() {
+    for registry in [None, Some(serde_json::json!({"installed":0,"next":"No saved flows"})),
+        Some(serde_json::json!({"flows":[]})), Some(serde_json::json!({"flows":null})),
+        Some(serde_json::json!({"flows":[{"id":"fixture/flow"}]}))] {
+        let needs_inventory = registry.as_ref().and_then(|value|value["flows"].as_array()).is_some_and(|flows| !flows.is_empty());
+        let mut body = serde_json::json!({"ok":true,"snapshot":"S","elements":[{"kind":"TextField","identifier":"field-a","label":"registry"}]});
+        if let Some(registry) = registry { body["registry"] = registry; }
+        let daemon = ScriptedDaemon::start("200 OK", body.to_string().into_bytes());
+        let home = tempfile::tempdir().unwrap();
+        let mut child = McpChild::start_options(&daemon.url,"off",&[
+            ("HOME",home.path().to_str().unwrap()),("IPHONE_USE_FLOWS_NO_AUTO_UPDATE","1"),
+            ("IPHONE_USE_MCP_PREWARM","0")]);
+        let reply = child.call_tool(2,"phone_elements",serde_json::json!({}));
+        assert!(reply.get("result").is_some() && reply["result"]["isError"] != true,"{reply}");
+        let requests = daemon.requests.lock().unwrap();
+        assert_eq!(requests.iter().any(|line|line.starts_with("GET /agent/apps ")),needs_inventory,"{requests:?}");
+        if !needs_inventory {
+            assert_eq!(requests.len(),1,"a screen with no flows must only read its elements: {requests:?}");
+        }
     }
 }
