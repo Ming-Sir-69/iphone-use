@@ -28,6 +28,10 @@ struct ScriptedDaemon {
 
 impl ScriptedDaemon {
     fn start(status: &'static str, body: Vec<u8>) -> Self {
+        Self::routed(status, body, None)
+    }
+
+    fn routed(status: &'static str, body: Vec<u8>, status_body: Option<Vec<u8>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -45,11 +49,23 @@ impl ScriptedDaemon {
                         // mid-response. Both sides get a deadline.
                         stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
                         stream.set_write_timeout(Some(Duration::from_secs(10))).ok();
-                        let mut buffer = [0_u8; 8_192];
-                        let _ = stream.read(&mut buffer);
+                        let mut request = Vec::with_capacity(1_024);
+                        let mut buffer = [0_u8; 1_024];
+                        while request.len() < 8_192 && !request.windows(2).any(|bytes| bytes == b"\r\n") {
+                            let remaining = (8_192 - request.len()).min(buffer.len());
+                            match stream.read(&mut buffer[..remaining]) {
+                                Ok(0) | Err(_) => break,
+                                Ok(count) => request.extend_from_slice(&buffer[..count]),
+                            }
+                        }
+                        let status_read = request.windows(2).any(|bytes| bytes == b"\r\n")
+                            && request.starts_with(b"GET /agent/status ");
+                        let truncated = status == "200 Truncated" && !status_read;
+                        let response_status = if status_read && status_body.is_some() || truncated { "200 OK" } else { status };
+                        let body = if status_read { status_body.as_ref().unwrap_or(&body) } else { &body };
                         let head = format!(
-                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
+                            "HTTP/1.1 {response_status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len() + if truncated {64} else {0}
                         );
                         let _ = stream.write_all(head.as_bytes());
                         let _ = stream.write_all(&body);
@@ -507,4 +523,19 @@ fn capabilities_reach_the_client_as_structured_content() {
     assert_eq!(structured["supported"]["element_tree"], true);
     assert_eq!(structured["available"]["blocked_by"], "released");
     assert_eq!(structured["scope"], "ui_control");
+}
+
+#[test]
+fn failed_capture_clears_old_pixels_despite_racing_open_status() {
+    for status in ["423 Locked", "503 Service Unavailable", "200 Truncated", "200 Empty"] {
+        let daemon = ScriptedDaemon::routed(status, if status == "200 Empty" {Vec::new()} else {br#"{"ok":false,"error":"capture_refused"}"#.to_vec()},
+            Some(br#"{"ok":true,"drivable":true,"screen_private_secs":0}"#.to_vec()));
+        let mut child = McpChild::start_with(&daemon.url, "off");
+        let reply = child.call_tool(2, "phone_screen_frame", serde_json::json!({}));
+        let body = &reply["result"]["structuredContent"];
+        assert_eq!(body["drivable"], true, "status fixture must remain open: {body}");
+        assert!(body["private_secs"].is_null());
+        assert!(body["frame"].is_null());
+        assert_eq!(body["clear_frame"], true, "{body}");
+    }
 }

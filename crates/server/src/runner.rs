@@ -117,6 +117,7 @@ pub struct RunnerClient {
     /// only so `/agent/screenshot` can answer without a new capture. Dropped
     /// by the next screen-changing POST.
     settled_frame: Option<(std::sync::Arc<Capture>, std::time::Instant)>,
+    settled_frame_generation: u64,
     /// Until when screenshots are not used to judge "settled" (a frame was
     /// slow or failed; see `settle_frame` in http.rs).
     settle_frames_paused_until: Option<std::time::Instant>,
@@ -348,6 +349,7 @@ impl RunnerClient {
             probe: ProbeMemory::default(),
             full_visibility: full_visibility_requested(),
             settled_frame: None,
+            settled_frame_generation: 0,
             settle_frames_paused_until: None,
             actionability_budget: ACTIONABILITY_PROBE_BUDGET,
             last_actionable: false,
@@ -2215,6 +2217,15 @@ impl RunnerClient {
 
     pub fn pause_settle_frames(&mut self, for_how_long: Duration) {
         self.settle_frames_paused_until = Some(std::time::Instant::now() + for_how_long);
+    }
+
+    /// Discard frames from an earlier caller privacy generation without waiting
+    /// for a screen-changing native command or sacrificing normal cache reuse.
+    pub fn fence_settled_frame(&mut self, generation: u64) {
+        if self.settled_frame_generation != generation {
+            self.settled_frame = None;
+            self.settled_frame_generation = generation;
+        }
     }
 
     /// Keep `frame` as the settled screen (see `settled_frame`).

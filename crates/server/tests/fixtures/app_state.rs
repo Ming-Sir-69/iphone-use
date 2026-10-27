@@ -64,6 +64,7 @@ fn fixture_app_state(password: Option<&str>) -> Arc<AppState> {
             std::collections::HashMap::new(),
         )),
         hold_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        privacy_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         private_until: std::sync::Arc::new(std::sync::Mutex::new(None)),
         owner: std::sync::Arc::new(std::sync::Mutex::new(None)),
         owner_lease_secs: 300,

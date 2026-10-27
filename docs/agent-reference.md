@@ -141,6 +141,17 @@ screenshots, `/agent/elements` and live video answer `423 screen_private`, open
 streams end, and status shows `screen_private_secs`. A later hold without
 `private` lifts it.
 
+Standalone `/agent/screenshot` and `/agent/elements` reads carry the privacy
+generation from their start through response-body publication. A private hold
+invalidates in-flight reads, queued bodies and settled-frame caches even if the
+hold is lifted before they finish. MJPEG/H.264 subscriptions from that earlier
+generation end; a new permitted viewer can start a fresh producer. Cleaning up
+an already expired deadline preserves work begun after expiry. The live panel
+clears its previous image on failed captures, including a body interrupted after
+HTTP headers. Bytes already committed to the connection cannot be recalled.
+Action-attached observations have a separate action receipt contract.
+
+
 **Pre-warm.** A released phone may already be coming back when you look:
 `warming:true` means the daemon started the bring-up ahead of time. MCP startup
 and status only request pre-warming with `IPHONE_USE_MCP_PREWARM=1` (off by

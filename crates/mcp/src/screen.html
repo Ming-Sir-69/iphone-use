@@ -72,6 +72,7 @@
 
   /* ── i18n: English is the source; Chinese follows the viewer's browser. ── */
   const I18N_ZH = {
+    "Waiting for a new permitted frame.": "正在等待允许显示的新画面。",
     "iPhone screen": "iPhone 屏幕",
     "connecting…": "正在连接…",
     "waiting for the first frame…": "正在等待第一帧画面…",
@@ -241,6 +242,13 @@
     return parts.join(" · ");
   }
 
+  function clearFrame(message) {
+    image.hidden = true;
+    image.removeAttribute("src");
+    empty.textContent = message;
+    empty.hidden = false;
+  }
+
   function show(body) {
     if (!body || typeof body !== "object") throw new Error("empty frame");
     const tone = body.error && !body.frame ? "bad"
@@ -251,12 +259,11 @@
       const step = (ZH && body.next_step_zh) || body.next_step || body.hint;
       if (step) text += " — " + step;
     }
-    if (body.private_secs) {
-      setStatus("warn", describe(body));
-      image.hidden = true;
-      image.removeAttribute("src");
-      empty.textContent = t("Someone is signing in on the phone. The screen stays hidden until the agent continues.");
-      empty.hidden = false;
+    if (body.private_secs || body.clear_frame) {
+      setStatus(body.private_secs ? "warn" : tone, body.private_secs ? describe(body) : text);
+      clearFrame(body.private_secs
+        ? t("Someone is signing in on the phone. The screen stays hidden until the agent continues.")
+        : t("Waiting for a new permitted frame."));
       return false;
     }
     setStatus(tone, text);
@@ -314,6 +321,7 @@
       failures = 0;
       delay = live ? Math.max(0, FRAME_INTERVAL_MS - (performance.now() - started)) : IDLE_INTERVAL_MS;
     } catch (error) {
+      clearFrame(t("Waiting for a new permitted frame."));
       failures += 1;
       delay = Math.min(5000, 1000 * failures);
       if (failures > 1) setStatus("bad", t("panel cannot reach iphone-use — {error}", { error: t(error.message) }));

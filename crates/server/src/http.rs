@@ -466,6 +466,7 @@ pub struct AppState {
     /// and the element tree are refused and open streams end. Ends with the
     /// hold. See [`AppState::screen_private_secs`].
     pub private_until: Arc<Mutex<Option<Instant>>>,
+    pub privacy_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Who is driving the phone right now (issue #72). A client that names
     /// itself with `X-Phone-Owner` takes this lease on its first control
     /// request and refreshes it on every one; other clients' control requests
@@ -966,7 +967,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/logout", get(logout))
         .route("/pair", get(pair_page).post(pair_submit))
         .route("/schedules", get(crate::schedules::page));
-    let api = api_routes().layer(axum::middleware::from_fn(crate::timing::layer));
+    let api = api_routes()
+        .layer(axum::middleware::from_fn(crate::timing::layer))
+        .layer(axum::middleware::from_fn(privacy_read_body_layer));
     let base = state.base_path.clone();
     let app = if base.is_empty() {
         pages.merge(api)
@@ -13242,8 +13245,14 @@ fn capture_settled_frame_later(
     if let Some(previous) = slot.take() {
         previous.abort();
     }
+    if screen_private_now(&state.private_until) { return; }
+    let privacy_epoch = state.privacy_epoch.clone();
+    let private_until = state.private_until.clone();
+    let generation = privacy_epoch.load(std::sync::atomic::Ordering::Acquire);
     let task = tokio::spawn(async move {
         let mut w = runner.lock().await;
+        if privacy_epoch.load(std::sync::atomic::Ordering::Acquire) != generation || screen_private_now(&private_until) { return; }
+        w.fence_settled_frame(generation);
         if w.last_post() != post_mark || w.settled_frame(SETTLED_FRAME_MAX_AGE).is_some() {
             return;
         }
@@ -13254,7 +13263,8 @@ fn capture_settled_frame_later(
         let budget = std::time::Duration::from_secs(3);
         if let Ok(Ok(frame)) = tokio::time::timeout(budget, w.screenshot_sized(shot, budget)).await
         {
-            if w.last_post() == post_mark && is_valid_capture(&frame) {
+            if w.last_post() == post_mark && is_valid_capture(&frame)
+                && privacy_epoch.load(std::sync::atomic::Ordering::Acquire) == generation && !screen_private_now(&private_until) {
                 w.remember_settled_frame(frame);
             }
         }
@@ -15048,6 +15058,24 @@ async fn agent_elements(
     query: Query<AgentElementsQuery>,
     headers: HeaderMap,
 ) -> Response {
+    // Authenticate before the cancellation gate, including a private screen.
+    if let Some(refused) = auth_refusal(browser_or_agent_auth(&state, &headers)) { return refused; }
+    let generation = state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire);
+    let response = unless_private(&state.private_until, &state.privacy_epoch, generation,
+        agent_elements_unfenced(state.clone(), query, headers)).await.unwrap_or_else(|| {
+            recover(state.element_snapshots.lock()).clear();
+            recover(state.owner_snapshots.lock()).clear();
+            agent_error(StatusCode::LOCKED, "screen_privacy_changed",
+                "screen privacy changed or was active during this read; it was cancelled without retry")
+        });
+    finish_private_read(&state, generation, response)
+}
+
+async fn agent_elements_unfenced(
+    state: State<Arc<AppState>>,
+    query: Query<AgentElementsQuery>,
+    headers: HeaderMap,
+) -> Response {
     let owner = trusted_owner(&state, &headers);
     let full_read = query.since.is_none();
     let scope = query.scope.clone();
@@ -15632,21 +15660,84 @@ fn screen_private_now(private_until: &Mutex<Option<Instant>>) -> bool {
     recover(private_until.lock()).is_some_and(|until| until > Instant::now())
 }
 
+fn private_read_refusal(state: &AppState, generation: u64) -> Option<Response> {
+    if let Some(refused) = screen_private_refusal(state) { return Some(refused); }
+    (state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire) != generation).then(|| {
+        agent_error(StatusCode::LOCKED, "screen_privacy_changed",
+            "screen privacy changed during this read; its result was discarded. Check current status before requesting a new observation")
+    })
+}
+
+fn finish_private_read(state: &AppState, generation: u64, response: Response) -> Response {
+    if refused_as_unauthenticated(&response) { return response; }
+    if let Some(refused) = private_read_refusal(state, generation) {
+        // A rejected read may already have built a snapshot internally; no
+        // later delta or indexed target may reuse that unserved baseline.
+        recover(state.element_snapshots.lock()).clear();
+        recover(state.owner_snapshots.lock()).clear();
+        return refused;
+    }
+    let mut response = response;
+    response.extensions_mut().insert(ReadPrivacyFence {
+        private_until: state.private_until.clone(), privacy_epoch: state.privacy_epoch.clone(), generation,
+    });
+    response
+}
+
+#[derive(Clone)]
+struct ReadPrivacyFence {
+    private_until: Arc<Mutex<Option<Instant>>>,
+    privacy_epoch: Arc<std::sync::atomic::AtomicU64>,
+    generation: u64,
+}
+
+/// Applied outside timing: no later JSON rewrite may strip the publication
+/// fence or lose its fixed-size timing/metrics enrichment before it is installed.
+async fn privacy_read_body_layer(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let response = next.run(request).await;
+    let Some(fence) = response.extensions().get::<ReadPrivacyFence>().cloned() else { return response; };
+    // The response can sit queued before the HTTP writer first polls its body.
+    use futures_util::StreamExt;
+    let ReadPrivacyFence { private_until, privacy_epoch, generation } = fence;
+    let (mut parts, body) = response.into_parts();
+    parts.headers.remove(header::CONTENT_LENGTH);
+    let stream = futures_util::stream::unfold((body.into_data_stream(), false), move |(mut body, done)| {
+        let private_until = private_until.clone();
+        let privacy_epoch = privacy_epoch.clone();
+        async move {
+            if done { return None; }
+            let current = || privacy_epoch.load(std::sync::atomic::Ordering::Acquire) == generation
+                && !screen_private_now(&private_until);
+            if !current() {
+                return Some((Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "screen privacy changed before body publication")), (body, true)));
+            }
+            let next = body.next().await?;
+            if !current() {
+                return Some((Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "screen privacy changed before body publication")), (body, true)));
+            }
+            Some((next.map_err(std::io::Error::other), (body, false)))
+        }
+    });
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
 /// Run `work` unless the screen turns private first (checked every 250 ms),
 /// so an open live feed ends at once when a private hold begins instead of
 /// waiting out its inactivity timeout.
 async fn unless_private<T>(
     private_until: &Mutex<Option<Instant>>,
+    privacy_epoch: &std::sync::atomic::AtomicU64,
+    generation: u64,
     work: impl std::future::Future<Output = T>,
 ) -> Option<T> {
     tokio::pin!(work);
     loop {
-        if screen_private_now(private_until) {
+        if privacy_epoch.load(std::sync::atomic::Ordering::Acquire) != generation || screen_private_now(private_until) {
             return None;
         }
         if let Ok(out) = tokio::time::timeout(std::time::Duration::from_millis(250), &mut work).await {
             // Finished after the hold began: drop it, never send it.
-            return (!screen_private_now(private_until)).then_some(out);
+            return (privacy_epoch.load(std::sync::atomic::Ordering::Acquire) == generation && !screen_private_now(private_until)).then_some(out);
         }
     }
 }
@@ -15656,9 +15747,28 @@ async fn unless_private<T>(
 fn set_screen_private(state: &AppState, private: bool, secs: u64) {
     let until = (private && secs > 0)
         .then(|| Instant::now() + std::time::Duration::from_secs(secs));
-    *recover(state.private_until.lock()) = until;
+    let mut current = recover(state.private_until.lock());
+    let now = Instant::now();
+    // Cleaning up an already expired deadline changes no permission. Fresh
+    // work started after expiry must survive an ordinary keep-awake hold.
+    let was_private = current.is_some_and(|deadline| deadline > now);
+    let will_be_private = until.is_some_and(|deadline| deadline > now);
+    let changed = *current != until && (was_private || will_be_private);
+    *current = until;
+    if changed {
+        state.privacy_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+    // Publish the hold and hub generation together: a reader released from
+    // this lock must not subscribe into the hub's previous privacy generation.
     if let Some(hub) = &state.video {
         hub.hide_until(until);
+    }
+    drop(current);
+    if changed {
+        state.cancel_settled_frame_prefetch();
+        recover(state.element_snapshots.lock()).clear();
+        recover(state.owner_snapshots.lock()).clear();
     }
 }
 
@@ -16436,11 +16546,11 @@ async fn agent_screenshot_capture(
     // The screen as it settled after the last action was captured then (see
     // `SETTLED_FRAME_MAX_AGE`); nothing was sent since, so it is this screen.
     if !raw && !fresh {
-        let settled = runner
-            .lock()
-            .await
-            .settled_frame(SETTLED_FRAME_MAX_AGE)
-            .filter(|frame| frame.covers(max_side));
+        let settled = {
+            let mut w = runner.lock().await;
+            w.fence_settled_frame(state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire));
+            w.settled_frame(SETTLED_FRAME_MAX_AGE).filter(|frame| frame.covers(max_side))
+        };
         if let Some(frame) = settled {
             return finish_screenshot(
                 runner,
@@ -16714,6 +16824,7 @@ async fn agent_mjpeg(
         }
         None => None,
     };
+    let privacy_generation = state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire);
     if let Some(refused) = screen_private_refusal(&state) {
         return refused;
     }
@@ -16806,6 +16917,7 @@ async fn agent_mjpeg(
             )
         }
     };
+    if let Some(refused) = private_read_refusal(&state, privacy_generation) { return refused; }
     match upstream {
         Ok(up) if up.status().is_success() => {
             let content_type = up
@@ -16840,16 +16952,18 @@ async fn agent_mjpeg(
             // A private hold taken while this feed is open ends it: the
             // person is signing in on the phone.
             let private_until = state.private_until.clone();
+    let privacy_epoch = state.privacy_epoch.clone();
             let timed = futures_util::stream::unfold(
                 (upstream, guard, activity_guard, false),
                 move |(mut upstream, guard, activity_guard, done)| {
                     let private_until = private_until.clone();
+            let privacy_epoch = privacy_epoch.clone();
                     async move {
                     if done {
                         return None;
                     }
                     let next = unless_private(
-                        &private_until,
+                        &private_until, &privacy_epoch, privacy_generation,
                         tokio::time::timeout(MJPEG_INACTIVITY_TIMEOUT, upstream.next()),
                     )
                     .await?;
@@ -16938,6 +17052,7 @@ async fn agent_h264(
         }
         None => None,
     };
+    let privacy_generation = state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire);
     if let Some(refused) = screen_private_refusal(&state) {
         return refused;
     }
@@ -16980,6 +17095,7 @@ async fn agent_h264(
             .await;
         }
     }
+    if let Some(refused) = private_read_refusal(&state, privacy_generation) { return refused; }
     let subscription = hub.subscribe(mode);
     let activity_guard = stream_id.map(|stream_id| {
         MjpegActivityGuard::register(state.mjpeg_stream_activity.clone(), stream_id)
@@ -16987,14 +17103,16 @@ async fn agent_h264(
     // A private hold taken while this feed is open ends it (the hub stops
     // capturing too, see `VideoHub::hide_until`).
     let private_until = state.private_until.clone();
+    let privacy_epoch = state.privacy_epoch.clone();
     let frames = futures_util::stream::unfold(
         (subscription, stream_guard, activity_guard, hub),
         move |(mut subscription, guard, activity_guard, hub)| {
             let private_until = private_until.clone();
+            let privacy_epoch = privacy_epoch.clone();
             async move {
             loop {
                 let next = unless_private(
-                    &private_until,
+                    &private_until, &privacy_epoch, privacy_generation,
                     tokio::time::timeout(MJPEG_INACTIVITY_TIMEOUT, subscription.frames.recv()),
                 )
                 .await?;
@@ -19656,6 +19774,24 @@ fn overlay_marks(rows: &[crate::runner::ElementRow], window: (f64, f64)) -> Vec<
 /// works. When the tree cannot be read the plain picture comes back with
 /// `x-overlay: unavailable`.
 async fn agent_screenshot(
+    state: State<Arc<AppState>>,
+    headers: HeaderMap,
+    query: Query<ScreenshotQuery>,
+) -> Response {
+    // Authenticate before the cancellation gate, including a private screen.
+    if let Some(refused) = auth_refusal(browser_or_agent_auth(&state, &headers)) { return refused; }
+    let generation = state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire);
+    let response = unless_private(&state.private_until, &state.privacy_epoch, generation,
+        agent_screenshot_unfenced(state.clone(), headers, query)).await.unwrap_or_else(|| {
+            recover(state.element_snapshots.lock()).clear();
+            recover(state.owner_snapshots.lock()).clear();
+            agent_error(StatusCode::LOCKED, "screen_privacy_changed",
+                "screen privacy changed or was active during this read; it was cancelled without retry")
+        });
+    finish_private_read(&state, generation, response)
+}
+
+async fn agent_screenshot_unfenced(
     state: State<Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<ScreenshotQuery>,

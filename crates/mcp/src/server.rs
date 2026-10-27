@@ -1447,12 +1447,20 @@ impl PhoneHandler {
             self.daemon.status(),
             self.daemon.screen_frame(side, fresh.unwrap_or(false))
         );
-        crate::screen::frame_result(
+        // A response body can be revoked after its 200 headers, surfacing as
+        // a transport error. Any failed capture must clear the previous pixels;
+        // a concurrent status response cannot authorize reusing them.
+        let clear_frame = !matches!(&frame, Ok(bytes) if !bytes.is_empty());
+        let mut result = crate::screen::frame_result(
             status
                 .map(|s| crate::screen::status_summary(&s, self.daemon.owner()))
                 .map_err(|e| format!("status failed: {e:#}")),
             frame.map_err(|e| format!("{e:#}")),
-        )
+        );
+        if clear_frame {
+            if let Some(body) = result.structured_content.as_mut() { body["clear_frame"] = true.into(); }
+        }
+        result
     }
 
     // -----------------------------------------------------------------------
