@@ -876,10 +876,9 @@ fn an_explicit_run_through_the_mcp_tools() {
     let run = &summary["run"];
     assert_eq!(run["key"]["run_id"], "mcp-task", "{run}");
     assert_eq!(run["key"]["owner"], "e2e-mcp", "{run}");
-    // elements, /agent/apps (the first read in a newly entered app carries a
-    // registry block, whose compat check reads the installed apps), tap,
-    // flow draft, elements after the refused end
-    assert_eq!(run["tool_calls"], 5, "{run}");
+    // elements, tap, flow draft, elements after the refused end. Empty
+    // registry hints must not add an unrelated /agent/apps request.
+    assert_eq!(run["tool_calls"], 4, "{run}");
     assert_eq!(run["observed_calls"], 1, "{run}");
     assert_eq!(run["model_round_trips"], 3, "{run}");
     // After the end, the session's calls no longer carry the run.

@@ -3903,6 +3903,11 @@ async fn with_flow_compat(daemon: &DaemonClient, body: String) -> String {
     if !body.contains("\"registry\"") {
         return body;
     }
+    let has_flows = serde_json::from_str::<serde_json::Value>(&body).ok().is_some_and(|value| {
+        value.get("registry").and_then(|registry| registry.get("flows"))
+            .and_then(serde_json::Value::as_array).is_some_and(|flows| !flows.is_empty())
+    });
+    if !has_flows { return body; }
     let installed = crate::compat::installed_apps(daemon).await;
     crate::registry::enrich_registry(body, installed.as_ref())
 }
