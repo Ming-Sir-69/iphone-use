@@ -251,6 +251,16 @@ static BOOL IPURUseRequestCache(void)
 {
   if (pid != NULL) *pid = 0;
   NSArray *active = [self activeApplicationElements];
+  // Both the app and SpringBoard branches select this same element when
+  // there is one valid active application. No system lookup or probe is needed.
+  if (active.count == 1) {
+    id sole = active.firstObject;
+    int solePID = [self pidForAXElement:sole];
+    if (solePID > 0) {
+      if (pid != NULL) *pid = solePID;
+      return sole;
+    }
+  }
   int springBoardPID = [self pidForAXElement:[self systemApplicationElement] ?: NSNull.null];
   NSMutableArray *candidates = [NSMutableArray array];
   id springBoard = nil;
