@@ -433,7 +433,9 @@
       var btn = el("button", "du-code-copy", lng === "en" ? "Copy" : "复制");
       btn.addEventListener("click", function () {
         var pre = block.querySelector("pre");
-        copyText(pre ? pre.innerText : "", btn, lng === "en" ? "Copied" : "已复制", false);
+        var code = pre ? pre.cloneNode(true) : null;
+        if (code) code.querySelectorAll(".du-prompt").forEach(function (prompt) { prompt.remove(); });
+        copyText(code ? code.textContent : "", btn, lng === "en" ? "Copied" : "已复制", false);
       });
       head.appendChild(btn);
     });
