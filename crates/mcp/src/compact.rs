@@ -84,6 +84,7 @@ fn row_line_with_ids(index: u64, row: &Value, show_id: bool, full_id: bool) -> S
     if let Some(value) = text(row, "value").filter(|value| *value != label) {
         line.push_str(&format!(" value={}", clip(&value)));
     }
+    if row.get("value_truncated")==Some(&Value::Bool(true)){line.push_str(" value_truncated");}
     if text(row, "placeholder").is_some() && text(row, "value").is_none() {
         line.push_str(&format!(
             " placeholder={}",
@@ -1292,5 +1293,16 @@ mod tests {
                           "steps": [{"index": 1, "kind": "tap_label", "ok": true}]})),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod value_preview_tests {
+    use super::*;
+    #[test]
+    fn explicit_preview_marker_survives_compact_rows() {
+        let row=serde_json::json!({"kind":"TextField","label":"Draft","value":"PREFIX","value_truncated":true});
+        let rendered=row_line(0,&row,true);assert!(rendered.contains("PREFIX")&&rendered.contains("value_truncated"));
+        let short=serde_json::json!({"kind":"TextField","label":"Draft","value":"short"});assert!(!row_line(0,&short,true).contains("value_truncated"));
     }
 }

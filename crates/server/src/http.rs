@@ -476,6 +476,8 @@ pub struct AppState {
     pub owner: Arc<Mutex<Option<PhoneOwner>>>,
     /// How long an owner's lease outlives its last control request.
     pub owner_lease_secs: u64,
+    /// Ownership incarnation, including release and same-name reacquisition.
+    pub owner_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// How a reconnect brings the managed supervisor up: `(setup_sh, log,
     /// udid) -> started`. Blocking. The daemon uses
     /// [`write_and_bootstrap_runner_agent`]; tests substitute a fake so a
@@ -627,6 +629,11 @@ fn claim_phone_owner(state: &AppState, headers: &HeaderMap) -> Result<bool, Resp
     let mut slot = recover(state.owner.lock());
     let previous = slot.clone();
     let outcome = arbitrate_owner(&mut slot, claim, now, lease);
+    if outcome.is_ok() {
+        let before = previous.as_ref().filter(|o| now.saturating_duration_since(o.last_seen) < lease).map(|o| &o.name);
+        let after = slot.as_ref().map(|o| &o.name);
+        if before != after { state.owner_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel); }
+    }
     drop(slot);
     match outcome {
         Ok(()) => {
@@ -744,7 +751,7 @@ async fn agent_owner_inner(
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         );
     }
-    *recover(state.owner.lock()) = None;
+    state.release_owner_lease();
     // While a lease is live the idle watchdog leaves the phone alone; the
     // idle window starts when it is given back, not at the last action.
     state.touch_activity();
@@ -766,6 +773,12 @@ pub type ElementSnapshotCache =
     std::collections::VecDeque<(String, Arc<Vec<crate::runner::ElementRow>>)>;
 
 impl AppState {
+    fn release_owner_lease(&self) {
+        let mut owner = recover(self.owner.lock());
+        *owner = None;
+        self.owner_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
     /// Stamp "remote driving happened just now" for the idle-release watchdog.
     /// Called by every `/agent` action and live-view request (NOT `/agent/status`,
     /// which the web client polls constantly — counting it would pin the phone
@@ -1022,6 +1035,7 @@ fn api_routes() -> Router<Arc<AppState>> {
         .route("/agent/h264/keyframe", post(agent_h264_keyframe))
         .route("/agent/elements", get(agent_elements))
         .route("/agent/activity", get(agent_activity))
+        .route("/agent/value", post(agent_value))
         .route("/agent/collect", post(agent_collect))
         .route("/agent/scroll_find", post(agent_scroll_find))
         .route("/agent/flow/draft", get(agent_flow_draft))
@@ -4824,7 +4838,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                     *recover(state.runner_health.lock()) = crate::runner::RunnerHealth::down();
                     state.released.store(true, Ordering::Release);
                     recover(state.flow_trail.lock()).reset();
-                    *recover(state.owner.lock()) = None;
+                    state.release_owner_lease();
                     note_idle_release();
                     release_backoff_until = None;
                     release_failures = 0;
@@ -4938,7 +4952,7 @@ pub fn spawn_idle_release_watchdog(state: Arc<AppState>) {
                 *recover(state.runner_health.lock()) = crate::runner::RunnerHealth::down();
                 state.released.store(true, Ordering::Release);
                 recover(state.flow_trail.lock()).reset();
-                *recover(state.owner.lock()) = None;
+                state.release_owner_lease();
                 note_idle_release();
                 was_up = false;
                 release_backoff_until = None;
@@ -5309,7 +5323,7 @@ fn spawn_phone_exit_watch(state: Arc<AppState>) {
                 *recover(state.runner_health.lock()) = crate::runner::RunnerHealth::down();
                 state.released.store(true, Ordering::Release);
                 recover(state.flow_trail.lock()).reset();
-                *recover(state.owner.lock()) = None;
+                state.release_owner_lease();
                 tracing::info!("the session was ended on the iPhone; phone released until the next request");
             }
             state.runner_lifecycle.finish_releasing(release_token);
@@ -6171,7 +6185,7 @@ async fn agent_mode_inner(
                 state
                     .released
                     .store(true, std::sync::atomic::Ordering::Release);
-                *recover(state.owner.lock()) = None;
+                state.release_owner_lease();
                 if let Err(error) = persist_human_handoff(true) {
                     tracing::error!(%error, "phone stopped but human handoff could not be persisted");
                     persisted = false;
@@ -11544,6 +11558,7 @@ async fn agent_wait_ocr(
     state: &AppState,
     w: &mut crate::runner::RunnerClient,
     expect: &AgentUiExpectation,
+    generation: u64,
     wait_deadline: tokio::time::Instant,
     poll_ms: u64,
 ) -> OcrWait {
@@ -11553,13 +11568,15 @@ async fn agent_wait_ocr(
     let mut last_observation = serde_json::Value::Null;
     let mut last_error: Option<String>;
     loop {
-        if state.screen_private_secs() > 0 {
+        if private_read_refusal(state, generation).is_some() {
             return OcrWait::Private;
         }
         attempts += 1;
-        match agent_ocr_read(w, wait_deadline).await {
+        let Some(read) = unless_private(&state.private_until, &state.privacy_epoch, generation,
+            agent_ocr_read(w, wait_deadline)).await else { return OcrWait::Private; };
+        match read {
             Ok(texts) => {
-                if state.screen_private_secs() > 0 {
+                if private_read_refusal(state, generation).is_some() {
                     return OcrWait::Private;
                 }
                 reads += 1;
@@ -11576,6 +11593,7 @@ async fn agent_wait_ocr(
             }
             Err(error) => last_error = Some(error),
         }
+        if private_read_refusal(state, generation).is_some() { return OcrWait::Private; }
         if tokio::time::Instant::now() >= wait_deadline {
             let mut observation = if last_observation.is_null() {
                 serde_json::json!({
@@ -11870,16 +11888,37 @@ async fn agent_actions(
 /// No screen text survives a privacy refusal, but prior dispatch counts and
 /// retry safety remain visible so an interrupted batch cannot be replayed.
 fn private_batch_refusal(index: usize, completed: usize, applied: usize) -> Response {
-    agent_actions_failure(
-        StatusCode::LOCKED, index, completed, applied, "screen_private",
-        "not_sent", applied == 0, &[], None,
-    )
+    private_batch_refusal_with_steps(index, completed, applied, &[])
+}
+fn private_batch_refusal_with_steps(index: usize, completed: usize, applied: usize, steps: &[serde_json::Value]) -> Response {
+    agent_actions_failure(StatusCode::LOCKED, index, completed, applied, "screen_private",
+        "not_sent", applied == 0, steps, None)
 }
 
 async fn agent_actions_inner(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: String,
+) -> Response {
+    let generation = state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire);
+    let observes_screen = serde_json::from_str::<AgentActionsRequest>(&body).ok().is_some_and(|request|
+        request.observe || request.steps.iter().any(|step| matches!(step, AgentActionStep::WaitFor { .. })));
+    let mut response = agent_actions_generation(State(state.clone()), headers, body, generation).await;
+    if observes_screen && !refused_as_unauthenticated(&response) {
+        response.extensions_mut().insert(BatchPrivacyFence {
+            private_until: state.private_until.clone(), epoch: state.privacy_epoch.clone(), generation,
+        });
+    }
+    response
+}
+
+fn batch_privacy_revoked(state: &AppState, observes_screen: bool, generation: u64) -> bool {
+    observes_screen && (screen_private_now(&state.private_until)
+        || state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire) != generation)
+}
+
+async fn agent_actions_generation(
+    State(state): State<Arc<AppState>>, headers: HeaderMap, body: String, privacy_generation: u64,
 ) -> Response {
     match agent_auth(&state, &headers) {
         AgentAuth::Locked => {
@@ -11917,7 +11956,7 @@ async fn agent_actions_inner(
     let observes_screen = request.observe || request.steps.iter().any(|step| {
         matches!(step, AgentActionStep::WaitFor { .. })
     });
-    if observes_screen && state.screen_private_secs() > 0 {
+    if batch_privacy_revoked(&state, observes_screen, privacy_generation) {
         return private_batch_refusal(0, 0, 0);
     }
     // `launch_app {"app": …}` becomes a bundle before the first step runs, so
@@ -12022,8 +12061,8 @@ async fn agent_actions_inner(
     let mut applied_actions = 0_usize;
     let mut step_results = Vec::with_capacity(request.steps.len());
     for (index, step) in request.steps.iter().enumerate() {
-        if observes_screen && state.screen_private_secs() > 0 {
-            return private_batch_refusal(index, completed, applied_actions);
+        if batch_privacy_revoked(&state, observes_screen, privacy_generation) {
+            return private_batch_refusal_with_steps(index, completed, applied_actions, &step_results);
         }
         if state.runner_lifecycle.is_transitioning()
             || state.released.load(std::sync::atomic::Ordering::Acquire)
@@ -12327,11 +12366,15 @@ async fn agent_actions_inner(
                         None,
                     );
                 }
-                step_results.push(serde_json::json!({
+                let mut receipt = serde_json::json!({
                     "index": index,
                     "kind": "action",
                     "ok": true
-                }));
+                });
+                if let Some((_, resolved)) = launch_resolutions.iter().find(|(step, _)| *step == index) {
+                    receipt["resolved"] = resolved.clone();
+                }
+                step_results.push(receipt);
             }
             AgentActionStep::Pause { ms } => {
                 if tokio::time::timeout_at(
@@ -12370,7 +12413,7 @@ async fn agent_actions_inner(
                     wait_started + std::time::Duration::from_millis(*timeout_ms),
                 );
                 if expect.uses_ocr() {
-                    match agent_wait_ocr(&state, &mut w, expect, wait_deadline, *poll_ms).await {
+                    match agent_wait_ocr(&state, &mut w, expect, privacy_generation, wait_deadline, *poll_ms).await {
                         OcrWait::Matched(observation) => {
                             step_results.push(serde_json::json!({
                                 "index": index,
@@ -12383,7 +12426,7 @@ async fn agent_actions_inner(
                             continue;
                         }
                         OcrWait::Private => {
-                            return private_batch_refusal(index, completed, applied_actions);
+                            return private_batch_refusal_with_steps(index, completed, applied_actions, &step_results);
                         }
                         OcrWait::TimedOut(observation) => {
                             return agent_actions_failure(
@@ -12418,8 +12461,8 @@ async fn agent_actions_inner(
                 let probes = if alert_only { None } else { wait_probe_predicates(expect) };
                 let mut probe_misses = 0_u64;
                 loop {
-                    if state.screen_private_secs() > 0 {
-                        return private_batch_refusal(index, completed, applied_actions);
+                    if batch_privacy_revoked(&state, observes_screen, privacy_generation) {
+                        return private_batch_refusal_with_steps(index, completed, applied_actions, &step_results);
                     }
                     attempts += 1;
                     // While the targets are not there yet, ask runner for just
@@ -12443,8 +12486,8 @@ async fn agent_actions_inner(
                     } else {
                         agent_wait_elements(&mut w, wait_deadline).await
                     };
-                    if state.screen_private_secs() > 0 {
-                        return private_batch_refusal(index, completed, applied_actions);
+                    if batch_privacy_revoked(&state, observes_screen, privacy_generation) {
+                        return private_batch_refusal_with_steps(index, completed, applied_actions, &step_results);
                     }
                     let rows = match read {
                         Ok(rows) => rows,
@@ -12577,8 +12620,8 @@ async fn agent_actions_inner(
         completed += 1;
     }
 
-    if observes_screen && state.screen_private_secs() > 0 {
-        return private_batch_refusal(completed, completed, applied_actions);
+    if batch_privacy_revoked(&state, observes_screen, privacy_generation) {
+        return private_batch_refusal_with_steps(completed, completed, applied_actions, &step_results);
     }
     state.touch_activity();
     // A read-only wait (including /alert/text) proves no input capability.
@@ -12586,16 +12629,6 @@ async fn agent_actions_inner(
         let mut health = recover(state.runner_health.lock());
         health.up = true;
         health.actionable = true;
-    }
-    // A launch by name says which app it opened (a loose name may have
-    // matched "Idol Ludo Board" for "idol ludo").
-    for (step_index, resolved) in launch_resolutions {
-        if let Some(step) = step_results
-            .iter_mut()
-            .find(|step| step["index"].as_u64() == Some(step_index as u64))
-        {
-            step["resolved"] = resolved;
-        }
     }
     let mut result = serde_json::json!({
         "ok": true,
@@ -12608,8 +12641,8 @@ async fn agent_actions_inner(
         let budget = std::time::Duration::from_millis(AGENT_INPUT_SETTLE_DEFAULT_MS);
         let (observed, report) =
             settle_and_read_elements(&mut w, budget, DEVICE_SETTLE_DEFAULT_CAP).await;
-        if state.screen_private_secs() > 0 {
-            return private_batch_refusal(completed, completed, applied_actions);
+        if batch_privacy_revoked(&state, observes_screen, privacy_generation) {
+            return private_batch_refusal_with_steps(completed, completed, applied_actions, &step_results);
         }
         if let Some((snapshot, rows)) = observed {
             let rows = Arc::new(rows);
@@ -12656,10 +12689,200 @@ async fn agent_actions_inner(
     }
     // A person can start a private hold while a read is in flight. Discard
     // every observation, including earlier step text, before returning it.
-    if observes_screen && state.screen_private_secs() > 0 {
-        return private_batch_refusal(completed, completed, applied_actions);
+    if batch_privacy_revoked(&state, observes_screen, privacy_generation) {
+        return private_batch_refusal_with_steps(completed, completed, applied_actions, &step_results);
     }
     agent_actions_json(StatusCode::OK, result)
+}
+
+#[derive(Clone)]
+struct ValueReadScope { epoch: u64, privacy_epoch: u64, owner: Option<String> }
+impl ValueReadScope {
+    fn capture(state: &AppState) -> Self {
+        let owner = recover(state.owner.lock());
+        let now = Instant::now();
+        let lease = std::time::Duration::from_secs(state.owner_lease_secs);
+        Self {
+            epoch: state.owner_epoch.load(std::sync::atomic::Ordering::Acquire),
+            privacy_epoch: state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire),
+            owner: owner.as_ref().filter(|owner| now.saturating_duration_since(owner.last_seen) < lease)
+                .map(|owner| owner.name.clone()),
+        }
+    }
+    fn current(&self, state: &AppState) -> bool {
+        let owner_matches = {
+            let owner = recover(state.owner.lock());
+            let now = Instant::now();
+            let lease = std::time::Duration::from_secs(state.owner_lease_secs);
+            self.epoch == state.owner_epoch.load(std::sync::atomic::Ordering::Acquire)
+                && self.owner.as_deref() == owner.as_ref()
+                    .filter(|owner| now.saturating_duration_since(owner.last_seen) < lease)
+                    .map(|owner| owner.name.as_str())
+        };
+        owner_matches
+            && self.privacy_epoch == state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire)
+            && !screen_private_now(&state.private_until)
+            && !state.released.load(std::sync::atomic::Ordering::Acquire)
+            && !state.runner_lifecycle.is_transitioning()
+    }
+}
+async fn scoped_value_read<T>(state: &AppState, scope: &ValueReadScope, work: impl std::future::Future<Output=T>) -> Option<T> {
+    tokio::pin!(work);
+    loop {
+        if !scope.current(state) { return None; }
+        if let Ok(value) = tokio::time::timeout(std::time::Duration::from_millis(250), &mut work).await {
+            return scope.current(state).then_some(value);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ValueReadFence {
+    state: Arc<AppState>,
+    scope: ValueReadScope,
+}
+fn value_scope_failure() -> serde_json::Value {
+    serde_json::json!({"ok":false,"error":"value_read_scope_changed","value_omitted":true,"hint":"The value was withheld after owner/privacy changed; check current status before a fresh read"})
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ValueReadRequest {
+    identifier: Option<String>,
+    label: Option<String>,
+    kind: Option<String>,
+    max_utf16: Option<u32>,
+}
+async fn agent_value(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let scope = ValueReadScope::capture(&state);
+    match agent_auth(&state, &headers) {
+        AgentAuth::Ok => {}
+        AgentAuth::Denied => {
+            return with_security_headers(
+                (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+            )
+        }
+        AgentAuth::Locked => {
+            return with_security_headers(
+                (StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response(),
+            )
+        }
+    }
+    if let Some(refused) = screen_private_refusal(&state) {
+        return refused;
+    }
+    if state.released.load(std::sync::atomic::Ordering::Acquire)
+        || state.runner_lifecycle.is_transitioning()
+    {
+        return json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"ok":false,"error":"device_unavailable"}),
+        );
+    }
+    let request = match serde_json::from_str::<ValueReadRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => return invalid_list_request("invalid value-read request".into()),
+    };
+    let selector = match (request.identifier.as_deref(), request.label.as_deref()) {
+        (Some(id), None) if !id.is_empty() && id.chars().count() <= 512 => {
+            format!("identifier == {}", runner_predicate_literal(id))
+        }
+        (None, Some(label)) if !label.is_empty() && label.chars().count() <= 512 => {
+            format!("label == {}", runner_predicate_literal(label))
+        }
+        _ => {
+            return invalid_list_request(
+                "give exactly one nonempty identifier or label, at most 512 characters".into(),
+            )
+        }
+    };
+    let limit = request.max_utf16.unwrap_or(8192);
+    if !(1..=65536).contains(&limit) {
+        return invalid_list_request("max_utf16 must be 1...65536".into());
+    }
+    let selector = if let Some(kind) = request.kind {
+        if kind.is_empty() || kind.len() > 80 {
+            return invalid_list_request("invalid kind".into());
+        }
+        if kind.trim_start_matches("XCUIElementType") == "SecureTextField" {
+            return json_response(StatusCode::FORBIDDEN,
+                serde_json::json!({"ok":false,"error":"secure_value_read_requires_human"}));
+        }
+        format!(
+            "({selector}) AND type == {}",
+            runner_predicate_literal(&format!(
+                "XCUIElementType{}",
+                kind.trim_start_matches("XCUIElementType")
+            ))
+        )
+    } else {
+        selector
+    };
+    let Some(runner) = &state.runner else {
+        return ControlRefusal::runner_not_configured().into_response();
+    };
+    state.touch_activity();
+    let work = scoped_value_read(&state, &scope, async {
+        let _priority = state.begin_runner_control();
+        let mut client = runner.lock().await;
+        let ids = client.find_elements("predicate string", &selector).await?;
+        if ids.len() != 1 {
+            return Ok::<_, anyhow::Error>(Err(if ids.is_empty() {
+                "element_not_found"
+            } else {
+                "ambiguous_element"
+            }));
+        }
+        client.read_element_value(&ids[0], limit).await.map(Ok)
+    });
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(15), work).await;
+    let current = || scope.current(&state);
+    let mut response = if !current() {
+        json_response(StatusCode::CONFLICT, value_scope_failure())
+    } else {
+        match outcome {
+            Ok(Some(Ok(Ok(mut value)))) if core::value_read::valid_contract(&value, limit) => {
+                value["ok"] = true.into();
+                json_response(StatusCode::OK, value)
+            }
+            Ok(Some(Ok(Err(error)))) => json_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                serde_json::json!({"ok":false,"error":error}),
+            ),
+            Err(_) => json_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                serde_json::json!({"ok":false,"error":"value_read_timeout"}),
+            ),
+            Ok(Some(Err(error)))
+                if crate::runner::runner_http_error(&error).is_some_and(|e| {
+                    e.message
+                        .as_deref()
+                        .is_some_and(|message| message.contains("secure_value_read_requires_human"))
+                }) =>
+            {
+                json_response(
+                    StatusCode::FORBIDDEN,
+                    serde_json::json!({"ok":false,"error":"secure_value_read_requires_human"}),
+                )
+            }
+            Ok(None) => json_response(StatusCode::CONFLICT, value_scope_failure()),
+            Ok(Some(Err(ref error))) if !crate::runner::runner_http_error(error).is_some_and(|e|
+                e.status.as_u16() == 501 || matches!(e.code.as_deref(), Some("unknown command" | "unsupported operation"))) =>
+                json_response(StatusCode::BAD_GATEWAY,
+                    serde_json::json!({"ok":false,"error":"value_read_failed","retry_safe":true})),
+            _ => json_response(
+                StatusCode::NOT_IMPLEMENTED,
+                serde_json::json!({"ok":false,"error":"full_value_unavailable","hint":"The runner did not supply a complete-value contract; upgrade it or use a permitted alternative read. No preview was promoted to a full value"}),
+            ),
+        }
+    };
+    response
+        .extensions_mut()
+        .insert(ValueReadFence { state, scope });
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -15934,6 +16157,13 @@ fn finish_private_read(state: &AppState, generation: u64, response: Response) ->
 }
 
 #[derive(Clone)]
+struct BatchPrivacyFence {
+    private_until: Arc<Mutex<Option<Instant>>>,
+    epoch: Arc<std::sync::atomic::AtomicU64>,
+    generation: u64,
+}
+
+#[derive(Clone)]
 struct ReadPrivacyFence {
     private_until: Arc<Mutex<Option<Instant>>>,
     privacy_epoch: Arc<std::sync::atomic::AtomicU64>,
@@ -15944,6 +16174,40 @@ struct ReadPrivacyFence {
 /// fence or lose its fixed-size timing/metrics enrichment before it is installed.
 async fn privacy_read_body_layer(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let response = next.run(request).await;
+    if let Some(fence) = response.extensions().get::<BatchPrivacyFence>().cloned() {
+        let (mut parts, body) = response.into_parts();
+        let bytes = match axum::body::to_bytes(body, 2 << 20).await {
+            Ok(bytes) => bytes,
+            Err(_) => return json_response(StatusCode::BAD_GATEWAY,
+                serde_json::json!({"ok":false,"error":"outcome_unknown","outcome":"unknown","retry_safe":false})),
+        };
+        parts.headers.remove(header::CONTENT_LENGTH);
+        let stream = futures_util::stream::once(async move {
+            let revoked = fence.epoch.load(std::sync::atomic::Ordering::Acquire) != fence.generation
+                || screen_private_now(&fence.private_until);
+            let bytes = if revoked {
+                let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                bytes::Bytes::from(crate::observation::redact_batch(value).to_string())
+            } else { bytes };
+            Ok::<_, std::io::Error>(bytes)
+        });
+        return Response::from_parts(parts, Body::from_stream(stream));
+    }
+
+    if let Some(fence) = response.extensions().get::<ValueReadFence>().cloned() {
+        let (mut parts, body) = response.into_parts();
+        let bytes = match axum::body::to_bytes(body, 1 << 20).await {
+            Ok(bytes) => bytes,
+            Err(_) => return json_response(StatusCode::BAD_GATEWAY, value_scope_failure()),
+        };
+        parts.headers.remove(header::CONTENT_LENGTH);
+        let stream = futures_util::stream::once(async move {
+            let bytes = if fence.scope.current(&fence.state) { bytes }
+                else { bytes::Bytes::from(value_scope_failure().to_string()) };
+            Ok::<_, std::io::Error>(bytes)
+        });
+        return Response::from_parts(parts, Body::from_stream(stream));
+    }
     let Some(fence) = response.extensions().get::<ReadPrivacyFence>().cloned() else { return response; };
     // The response can sit queued before the HTTP writer first polls its body.
     use futures_util::StreamExt;

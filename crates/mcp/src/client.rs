@@ -767,6 +767,12 @@ impl DaemonClient {
         read_response(req.send().await?).await
     }
 
+    /// Metadata POST for a read; deliberately carries no control header.
+    pub async fn read_value(&self, body: &serde_json::Value) -> anyhow::Result<DaemonResponse> {
+        let request=self.auth(self.http().post(self.url("/agent/value"))).timeout(Duration::from_secs(20)).json(body);
+        read_response(request.send().await?).await
+    }
+
     /// A swiping list call (`/agent/collect`, `/agent/scroll_find`): several
     /// reads and swipes in one request, so it gets the batch budget — the
     /// daemon answers within its own 80 s deadline.

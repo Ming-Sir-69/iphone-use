@@ -195,6 +195,21 @@ pub struct ScreenFrameParams {
     pub fresh: Option<bool>,
 }
 
+/// Select exactly one current field without focusing it or changing the app.
+#[derive(Debug,Default,Deserialize,Serialize,JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadValueParams {
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub identifier:Option<String>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub label:Option<String>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub kind:Option<String>,
+    /// Maximum UTF-16 units returned (1–65536, default 8192); emoji may use two.
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub max_utf16:Option<u32>,
+}
+
 /// Parameters for [`phone_key`].
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -683,7 +698,8 @@ pub struct ReconnectParams {
     /// Wait up to this many seconds (1–300) for the outcome instead of
     /// returning at once: the call returns when the phone is drivable, a
     /// blocker appears (setup_blocked_on, e.g. the passcode), or the time is
-    /// up — with the compact final state. A runner rebuild after an upgrade
+    /// up — with the compact final state (a blocker other than the passcode
+    /// must hold for 20 s first). A runner rebuild after an upgrade
     /// takes 1–2 min, so 180 covers it. Omit to return immediately.
     #[serde(default)]
     pub wait_secs: Option<u64>,
@@ -712,6 +728,11 @@ fn reconnect_brief(status: &crate::types::StatusResponse) -> serde_json::Value {
 
 /// Whether a waiting reconnect is finished, and why.
 fn reconnect_wait_outcome(status: &crate::types::StatusResponse) -> Option<&'static str> {
+    if ["ended_on_phone", "runner_parked", "human_handoff"].iter()
+        .any(|key| status.extra.get(*key).and_then(serde_json::Value::as_bool) == Some(true)) {
+        return Some("stopped");
+    }
+
     if status
         .setup_blocked_on
         .as_deref()
@@ -720,6 +741,23 @@ fn reconnect_wait_outcome(status: &crate::types::StatusResponse) -> Option<&'sta
         return Some("blocked");
     }
     (status.drivable == Some(true) && status.reconnecting != Some(true)).then_some("drivable")
+}
+
+/// How long a blocker other than the passcode must persist, while the daemon
+/// is still reconnecting, before a waiting reconnect reports it. Early phases
+/// report transient ones: on a Wi-Fi phone `ddi-wait` says `usb` for a moment
+/// before the tunnel comes up and the runner build starts.
+const RECONNECT_BLOCKER_SETTLE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Whether a blocker seen for `held` should end the wait now.
+fn reconnect_blocker_final(
+    status: &crate::types::StatusResponse,
+    held: std::time::Duration,
+) -> bool {
+    let blocker = status.setup_blocked_on.as_deref().unwrap_or_default();
+    status.reconnecting != Some(true)
+        || blocker.starts_with("needs_passcode")
+        || held >= RECONNECT_BLOCKER_SETTLE
 }
 
 /// Parameters for [`PhoneHandler::phone_run_start`].
@@ -1521,6 +1559,35 @@ impl PhoneHandler {
         result
     }
 
+    #[tool(
+        annotations(read_only_hint=true,open_world_hint=true),
+        description="Read one current element's AX value without tapping, focusing, waking or taking an owner lease. Give exactly one identifier or exact label from a fresh screen, optionally kind; ambiguity refuses. Use this when phone_elements marks value_truncated or the task needs full field text. Returns one bounded value in text with source/completeness metadata; complete means the AX attribute was not cut by this API, not that the app exposes its full document. A smaller max_utf16 returns truncated:true. Secure fields refuse; old runners without ipu:valueRead refuse rather than promote a preview. Owner/privacy changes withhold the value."
+    )]
+    async fn phone_read_value(&self, Parameters(params): Parameters<ReadValueParams>) -> CallToolResult {
+        let limit = params.max_utf16.unwrap_or(8192);
+        let request = serde_json::to_value(params).unwrap_or_else(|_| serde_json::json!({}));
+        match self.daemon.read_value(&request).await {
+            Ok(response) => {
+                if let Some(body) = response.json.as_ref().filter(|body| response.ok() && body["ok"] == true
+                    && iu_core::value_read::valid_contract(body, limit)) {
+                    // Hosts may show only structuredContent when it exists.
+                    // A content-only result keeps the full value visible once
+                    // in every output mode, without a competing metadata copy.
+                    return CallToolResult::success(vec![Content::text(body.to_string())]);
+                }
+                if let Some(body) = response.json.as_ref().filter(|body| body["ok"] == false) {
+                    let mut safe = body.clone();
+                    if let Some(object) = safe.as_object_mut() { object.remove("value"); }
+                    let mut result = CallToolResult::error(vec![Content::text(safe.to_string())]);
+                    result.structured_content = Some(safe);
+                    return result;
+                }
+                CallToolResult::error(vec![Content::text("full value contract unavailable; no preview was promoted to a complete value")])
+            }
+            Err(_) => CallToolResult::error(vec![Content::text("value read failed; no input was sent and no preview was promoted to a complete value")]),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // phone_elements (L2)
     // -----------------------------------------------------------------------
@@ -1541,7 +1608,7 @@ impl PhoneHandler {
         block means a system alert is up: answer it with an `alert` step, taps on alerts do not act. \
         ocr=auto adds text read from pixels when the tree has no interactive rows (games, \
         canvases), ocr=force always; such rows have no element, tap their x/y with phone_tap. \
-        Requires phone_status drivable=true."
+        value_truncated marks an incomplete preview; use phone_read_value for the bounded full AX value. Requires phone_status drivable=true."
     )]
     async fn phone_elements(
         &self,
@@ -1780,7 +1847,7 @@ impl PhoneHandler {
         or a blocker remains. Once these conditions are met, call once, \
         then wait for the outcome: pass wait_secs (e.g. 180) to block until drivable=true, \
         a blocker (setup_blocked_on), or the timeout, instead of polling phone_status; \
-        `wait.outcome` is drivable, blocked or timeout. While it is reconnecting, report \
+        `wait.outcome` is drivable, blocked, stopped or timeout. While it is reconnecting, report \
         setup_phase/setup_message and obey setup_blocked_on. This tool \
         never accepts a UDID and cannot switch devices. \
         An externally managed runner returns an operator-owned recovery error."
@@ -1813,15 +1880,40 @@ impl PhoneHandler {
         let started = tokio::time::Instant::now();
         let deadline = started + std::time::Duration::from_secs(wait_secs);
         let mut last_status = None;
-        let mut last_error: Option<String>;
+        let mut last_error: Option<String> = None;
+        let mut blocked_since: Option<(String, tokio::time::Instant)> = None;
         let outcome = loop {
-            match self.daemon.status().await {
+            if tokio::time::Instant::now() >= deadline { break "timeout"; }
+            let status = match tokio::time::timeout_at(deadline, self.daemon.status()).await {
+                Ok(status) => status,
+                Err(_) => {
+                    last_error = Some("status read exceeded the remaining wait budget".to_string());
+                    break "timeout";
+                }
+            };
+            match status {
                 Ok(status) => {
                     let done = reconnect_wait_outcome(&status);
+                    let finished = match done {
+                        Some("blocked") => {
+                            let blocker = status.setup_blocked_on.clone().unwrap_or_default();
+                            let since = match &blocked_since {
+                                Some((seen, at)) if *seen == blocker => *at,
+                                _ => tokio::time::Instant::now(),
+                            };
+                            blocked_since = Some((blocker, since));
+                            reconnect_blocker_final(&status, since.elapsed())
+                        }
+                        Some(_) => true,
+                        None => {
+                            blocked_since = None;
+                            false
+                        }
+                    };
                     last_status = Some(status);
                     last_error = None;
-                    if let Some(outcome) = done {
-                        break outcome;
+                    if finished {
+                        break done.unwrap_or("drivable");
                     }
                 }
                 Err(e) => last_error = Some(format!("{e:#}")),
@@ -4670,7 +4762,7 @@ mod tests {
 
     /// The tools that only read: no phone input, no outward-facing writes.
     /// `IPHONE_USE_MCP_TOOLS=readonly` exposes exactly these.
-    const READ_ONLY_TOOLS: [&str; 13] = [
+    const READ_ONLY_TOOLS: [&str; 14] = [
         "phone_apps",
         "phone_capabilities",
         "phone_crashes",
@@ -4680,6 +4772,7 @@ mod tests {
         "phone_flow_list",
         "phone_home_layout",
         "phone_instances",
+        "phone_read_value",
         "phone_screen",
         "phone_screen_frame",
         "phone_screenshot",
@@ -5308,6 +5401,18 @@ mod tests {
         let blocked = status(serde_json::json!({"ok": true, "drivable": false,
             "reconnecting": true, "setup_blocked_on": "needs_passcode_on_phone"}));
         assert_eq!(reconnect_wait_outcome(&blocked), Some("blocked"));
+        // The passcode ends the wait at once; a transient early blocker only
+        // once it has held, or once the daemon stopped reconnecting.
+        let zero = std::time::Duration::ZERO;
+        assert!(reconnect_blocker_final(&blocked, zero));
+        let ddi = status(serde_json::json!({"ok": true, "drivable": false,
+            "reconnecting": true, "setup_blocked_on": "usb", "setup_phase": "ddi-wait"}));
+        assert_eq!(reconnect_wait_outcome(&ddi), Some("blocked"));
+        assert!(!reconnect_blocker_final(&ddi, zero));
+        assert!(reconnect_blocker_final(&ddi, RECONNECT_BLOCKER_SETTLE));
+        let gave_up = status(serde_json::json!({"ok": true, "drivable": false,
+            "reconnecting": false, "setup_blocked_on": "usb"}));
+        assert!(reconnect_blocker_final(&gave_up, zero));
         let brief = reconnect_brief(&blocked);
         assert_eq!(brief["setup_blocked_on"], "needs_passcode_on_phone");
         assert_eq!(brief["drivable"], false);

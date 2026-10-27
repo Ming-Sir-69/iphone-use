@@ -15,6 +15,8 @@ on:
       - scripts/test-simulator-smoke.sh
       - scripts/test-drag-simulator.py
       - scripts/test-drag-simulator-verdict.py
+      - scripts/test-value-read-simulator.py
+      - scripts/value-read-fixture.swift
       - .github/workflows/simulator-smoke.yml
   workflow_dispatch:
 
@@ -76,6 +78,9 @@ jobs:
           include-hidden-files: true
           if-no-files-found: ignore
           path: |
+            ~/.iphone-use/instances/ci-sim/value-read/result.json
+            ~/.iphone-use/instances/ci-sim/value-read/mcp.log
+            ~/.iphone-use/instances/ci-sim/value-read/fixture-build.log
             ~/.iphone-use/instances/ci-sim/gesture-acceptance/**/result.json
             ~/.iphone-use/instances/ci-sim/gesture-acceptance/**/*.png
             ~/.iphone-use/instances/ci-sim/gesture-acceptance/**/flow.log
