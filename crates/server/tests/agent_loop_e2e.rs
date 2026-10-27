@@ -11,6 +11,7 @@ mod support;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::MetadataExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -71,6 +72,11 @@ fn spawn_daemon_with(
     home: &std::path::Path,
     extra: &[(&str, &str)],
 ) -> Daemon {
+    // Probing an unused port cannot reserve it for the child. Retry only a
+    // confirmed bind collision, before any test request/action is dispatched.
+    let pid_path = state.join(format!("iphone-use-{}-e2e", state.metadata().unwrap().uid()))
+        .join("iphone-use.pid");
+    'startup: for attempt in 0..4 {
     let port = free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_iphone-use"))
         .arg("serve")
@@ -98,16 +104,30 @@ fn spawn_daemon_with(
         .stderr(std::fs::File::create(state.join("daemon.err")).unwrap())
         .spawn()
         .expect("spawn iphone-use serve");
-    let daemon = Daemon { child, port, error_log: state.join("daemon.err") };
+    let mut daemon = Daemon { child, port, error_log: state.join("daemon.err") };
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        if let Some(status) = daemon.child.try_wait().expect("poll daemon startup") {
+            let log = std::fs::read_to_string(&daemon.error_log).unwrap_or_default();
+            if attempt < 3 && log.contains("Address already in use") {
+                continue 'startup;
+            }
+            panic!("daemon exited before readiness ({status}):\n{log}");
+        }
+        // The daemon writes its own PID record only AFTER binding. A TCP
+        // connection alone may have reached the process that stole this port.
+        let owns_listener = std::fs::read(&pid_path).ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|record| record["pid"].as_u64() == Some(daemon.child.id() as u64));
+        if owns_listener && TcpStream::connect(("127.0.0.1", port)).is_ok() {
             return daemon;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     let log = std::fs::read_to_string(state.join("daemon.err")).unwrap_or_default();
     panic!("daemon did not listen on {port}:\n{log}");
+    }
+    unreachable!("startup either returns or reports a bounded failure")
 }
 
 /// One HTTP/1.1 request; returns (status, JSON body).
