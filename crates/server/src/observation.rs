@@ -122,6 +122,24 @@ pub fn redact(mut value: Value, reason: &str) -> Value {
     }
     value
 }
+/// A batch's top-level verdict includes screen-derived wait results. It is
+/// revoked even though individual confirmed action receipts remain valid.
+pub fn redact_batch(value: Value) -> Value {
+    let mut safe = redact(value, "screen_privacy_changed");
+    let has_wait = safe.get("steps").and_then(Value::as_array)
+        .is_some_and(|steps| steps.iter().any(|step| step["kind"] == "wait_for"));
+    if let Some(map) = safe.as_object_mut() {
+        map.insert("ok".into(), false.into());
+        map.insert("error".into(), "screen_privacy_changed".into());
+        map.insert("retry_safe".into(), false.into());
+        // Batch progress and the failed-step position can also encode whether
+        // a screen expectation matched. Applied-action receipts stay in steps.
+        if has_wait { map.remove("completed"); }
+        map.remove("failed_step");
+        map.remove("failed_step_outcome");
+    }
+    safe
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,8 +187,9 @@ mod wait_receipt_tests {
             {"index":0,"kind":"action","ok":true},
             {"index":1,"kind":"wait_for","ok":true,"observation":{"lines":["PRIVATE"]}}
         ]});
-        let safe = super::redact(value, "screen_privacy_changed");
-        assert_eq!(safe["ok"], true);
+        let safe = super::redact_batch(value);
+        assert_eq!(safe["ok"], false);
+        assert_eq!(safe["error"], "screen_privacy_changed");
         assert_eq!(safe["applied_actions"], 1);
         assert_eq!(safe["steps"][0]["ok"], true);
         assert!(safe["steps"][1].get("ok").is_none());

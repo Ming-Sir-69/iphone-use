@@ -15989,7 +15989,7 @@ async fn privacy_read_body_layer(request: axum::extract::Request, next: axum::mi
                 || screen_private_now(&fence.private_until);
             let bytes = if revoked {
                 let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-                bytes::Bytes::from(crate::observation::redact(value,"screen_privacy_changed").to_string())
+                bytes::Bytes::from(crate::observation::redact_batch(value).to_string())
             } else { bytes };
             Ok::<_, std::io::Error>(bytes)
         });

@@ -162,6 +162,8 @@ fn queued_ocr_body_withholds_text_without_erasing_tap_acknowledgement() {
             body["steps"][1].get("ok").is_none(),
             "revoked waits cannot retain a success verdict"
         );
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"], "screen_privacy_changed");
         assert_eq!(body["observation_omitted"], true);
         assert_eq!(body["scope_changed"], "screen_privacy_changed");
         assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE_BOARD"));
@@ -199,6 +201,8 @@ fn queued_element_wait_withholds_observation_but_preserves_action_receipt() {
         assert_eq!(body["steps"][0]["ok"], true);
         assert_eq!(body["applied_actions"], 1);
         assert!(body["steps"][1].get("ok").is_none());
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"], "screen_privacy_changed");
         assert_eq!(body["observation_omitted"], true);
         assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE_BOARD"));
     });
