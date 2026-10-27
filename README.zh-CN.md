@@ -23,6 +23,8 @@ Claude Code、Codex 或任何 MCP 客户端都能用它把屏幕读成文字，�
   <strong>简体中文</strong>
 </p>
 
+<p align="center"><strong>官网与文档：<a href="https://iphone-use.leeguoo.com/">iphone-use.leeguoo.com</a></strong></p>
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
 ```

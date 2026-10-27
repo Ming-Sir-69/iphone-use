@@ -23,6 +23,8 @@ Claude Code, Codex or any MCP client reads the screen as text, taps, types and s
   <a href="README.zh-CN.md">简体中文</a>
 </p>
 
+<p align="center"><strong>Website and docs: <a href="https://iphone-use.leeguoo.com/en/">iphone-use.leeguoo.com</a></strong></p>
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh | sh
 ```
