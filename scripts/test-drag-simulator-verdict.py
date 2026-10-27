@@ -16,6 +16,20 @@ spec.loader.exec_module(check)
 
 
 class VerdictTests(unittest.TestCase):
+    def test_scroll_touch_down_uses_independent_table_geometry_without_reducing_travel(self):
+        record={"window_size":[402,874],"table_rect":[0,246,402,542]}
+        x,y=check.input_scroll_anchor(record)
+        travel=300*1.5
+        start=y*874+travel/2
+        end=y*874-travel/2
+        self.assertEqual(x,.5)
+        self.assertTrue(246<start<788)
+        self.assertGreaterEqual(end,44)
+        self.assertEqual(start-end,travel)
+        self.assertGreater(.65*874+travel/2,788)
+        for bad in [{},dict(record,table_rect=[0,0,10,10]),dict(record,window_size=[402,float('nan')])]:
+            with self.assertRaises(RuntimeError):check.input_scroll_anchor(bad)
+
     def busy_error(self, payload=None, code=504):
         if payload is None:
             payload = {"error":"runner_source_timeout","runner_busy":True,"retry_after_secs":2}

@@ -334,6 +334,33 @@ def judge_input(record, nonce, kind, row):
     return errors
 
 
+def input_scroll_anchor(record, dy=300):
+    """Keep the requested viewport travel; put touch-down inside UIKit's table.
+
+    x/y is the *middle* of the viewport scroll span, not its down point. A fixed
+    .65 can therefore begin on a bottom toolbar in another device/OS layout.
+    """
+    size, rect = record.get("window_size"), record.get("table_rect")
+    if not (isinstance(size,list) and len(size)==2 and isinstance(rect,list) and len(rect)==4
+            and all(type(v) in (int,float) and math.isfinite(v) for v in size+rect)):
+        raise RuntimeError("no independent UIKit scroll geometry; nothing sent")
+    width,height=size;left,top,table_width,table_height=rect
+    if min(width,height,table_width,table_height)<=0 or dy<=0:
+        raise RuntimeError("invalid UIKit scroll geometry; nothing sent")
+    travel=min(max(abs(dy)*1.5,.15*height),.75*height)
+    low=max(top+12,travel+44)
+    high=min(top+table_height-12,height-44)
+    if low>high:
+        raise RuntimeError("requested scroll has no valid table touch-down point; nothing sent")
+    start=min(max(top+table_height/2,low),high)
+    end=start-travel
+    x=left+table_width/2
+    if not (top+12<=start<top+table_height and end>=44 and 44<=x<=width-44):
+        raise RuntimeError("requested scroll cannot start inside this table/screen; nothing sent")
+    return x/width, (start+end)/2/height
+
+
+
 def input_case(daemon, args, label, kind):
     out = args.out / label
     out.mkdir()
@@ -349,8 +376,9 @@ def input_case(daemon, args, label, kind):
     row = 8 if kind == "scroll" else 3
     steps = []
     if kind == "scroll":
+        anchor_x, anchor_y = input_scroll_anchor(before)
         steps.extend([
-            {"kind": "action", "action": {"type": "scroll", "x": 0.5, "y": 0.65, "dx": 0, "dy": 300}},
+            {"kind": "action", "action": {"type": "scroll", "x": anchor_x, "y": anchor_y, "dx": 0, "dy": 300}},
             {"kind": "wait_for", "expect": {"present": [{"identifier": f"input-row-{row}", "kind": "Cell"}]}, "timeout_ms": 4000},
         ])
     if kind == "typing":
