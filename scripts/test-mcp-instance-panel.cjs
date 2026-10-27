@@ -6,10 +6,11 @@ const path = require('node:path');
 const html = fs.readFileSync(path.join(__dirname, '../crates/mcp/src/screen.html'), 'utf8');
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1]
   .replaceAll('__IU_FRAME_TOOL__', 'phone_screen_frame').replaceAll('__IU_VERSION__', 'test');
-function panel() {
+function panel(body={released:true,drivable:false,phone:'mock'}) {
   const elements = new Map();
   const element = (id) => {
     if (!elements.has(id)) elements.set(id, {dataset:{}, hidden:true, disabled:false,
+      removeAttribute(name){delete this[name];},
       events:{}, addEventListener(name, callback) { this.events[name] = callback; }});
     return elements.get(id);
   };
@@ -19,7 +20,7 @@ function panel() {
     if (message.method === 'tools/call') calls.push(message.params);
     if (message.id !== undefined && message.method) queueMicrotask(() => notify({
       jsonrpc:'2.0', id:message.id, result: message.method === 'ui/initialize'
-        ? {hostContext:{}} : {structuredContent:{released:true,drivable:false,phone:'mock'}}
+        ? {hostContext:{}} : {structuredContent:body}
     }));
   }};
   const window = {parent, innerWidth:320, addEventListener(name, callback) {listeners[name] = callback;}};
@@ -63,5 +64,12 @@ function panel() {
   assert.equal(Object.hasOwn(configured.calls[0].arguments,'instance'),false,'implicit target preserves startup config');
   const explicit=panel();explicit.input({instance:'default'});await explicit.flush();
   assert.equal(explicit.calls[0].arguments.instance,'default');
+  const frame={drivable:true,frame:{mime_type:'image/png',data:'fixture'}};
+  const privacy=panel(frame);privacy.input({});await privacy.flush();
+  assert.equal(privacy.element('image').hidden,false);
+  delete frame.frame;frame.clear_frame=true;
+  await privacy.element('refresh').events.click();await privacy.flush();
+  assert.equal(privacy.element('image').hidden,true,'capture refusal clears previously displayed pixels');
+  assert.equal(privacy.element('image').src,undefined);
   console.log('MCP panel: waits for binding; frame and Home stay on one instance; invalid input and teardown fail closed');
 })().catch(error=>{console.error(error);process.exitCode=1;});
