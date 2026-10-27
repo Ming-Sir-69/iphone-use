@@ -512,6 +512,20 @@ pub fn batch(json: &Value) -> Option<String> {
         if !list.is_empty() {
             out.push(format!("steps: {list}"));
         }
+        // Which app a launch by name opened (a loose name can match a longer one).
+        for (position, step) in steps.iter().enumerate() {
+            let Some(resolved) = step.get("resolved") else {
+                continue;
+            };
+            let index = text(step, "index").unwrap_or_else(|| (position + 1).to_string());
+            out.push(format!(
+                "resolved: step {index} app {:?} → {} ({}, {} match)",
+                text(resolved, "app").unwrap_or_default(),
+                text(resolved, "name").unwrap_or_default(),
+                text(resolved, "bundle_id").unwrap_or_default(),
+                text(resolved, "match").unwrap_or_default(),
+            ));
+        }
     }
     out.extend(lines.map(str::to_string));
     Some(out.join("\n"))
@@ -1226,6 +1240,21 @@ mod tests {
             text.len() * 2 < json_bytes,
             "compact {} B vs JSON {json_bytes} B:\n{text}",
             text.len()
+        );
+    }
+
+    #[test]
+    fn a_batch_says_which_app_a_loose_launch_name_opened() {
+        let mut body = bluetooth_batch();
+        body["steps"][0] = json!({"index": 1, "kind": "action", "ok": true, "resolved": {
+            "app": "idol ludo", "name": "Idol Ludo Board",
+            "bundle_id": "com.kr.idolludobroard", "match": "partial"}});
+        let text = batch(&body).unwrap();
+        assert!(
+            text.contains(
+                "resolved: step 1 app \"idol ludo\" → Idol Ludo Board (com.kr.idolludobroard, partial match)"
+            ),
+            "{text}"
         );
     }
 

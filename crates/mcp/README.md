@@ -319,7 +319,7 @@ carries a `registry.hint` to save it as a flow, and a failed `phone_flow_run` na
 |---|---|---|
 | `phone_status` | — | Query backend, canonical target, `drivable`, device-runner readiness, lifecycle, and recovery hints |
 | `phone_capabilities` | — | What this build supports for the configured backend, and whether the phone can be driven now. Read-only: wakes nothing, takes no owner lease |
-| `phone_reconnect` | — | Restart the daemon-managed device runner once, then poll `phone_status`; never changes backend or target |
+| `phone_reconnect` | `wait_secs?` (1–300) | Restart the daemon-managed device runner once; with `wait_secs`, return when drivable, blocked (`setup_blocked_on`) or timed out, else poll `phone_status`; never changes backend or target |
 | `phone_hold` | `secs` | Keep the phone through a bounded human-in-the-loop pause (a PIN, a code): the idle watchdog does not release it for `secs` (0 clears, max 14400) |
 | `phone_release_owner` | — | Release this session's owner lease when the task is done |
 | `phone_login` | `item?`, `user?`, `submit?`, `code_via?`, `code_from?` | Sign the app on screen in from the user's own vault entry (bitwarden-use), inside the daemon; the password never reaches the model |

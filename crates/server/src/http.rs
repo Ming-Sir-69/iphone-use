@@ -9433,6 +9433,10 @@ const AGENT_ACTIONS_MAX_STEPS: usize = 24;
 /// deadline ([`AGENT_ACTIONS_DEADLINE`]) are deliberately unchanged, so a
 /// longer single wait cannot lengthen a batch.
 const AGENT_ACTIONS_MAX_WAIT_MS: u64 = 30_000;
+/// Longest an OCR `wait_for` may be given: a game's splash screen loads for
+/// 20–40 s, and it is the only wait in its batch (the declared-wait cap and
+/// the batch deadline still bound the whole batch).
+const AGENT_ACTIONS_MAX_OCR_WAIT_MS: u64 = 60_000;
 const AGENT_ACTIONS_MAX_PAUSE_MS: u64 = 3_000;
 const AGENT_ACTIONS_MAX_DECLARED_WAIT_MS: u64 = 60_000;
 const AGENT_ACTIONS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(75);
@@ -10437,6 +10441,20 @@ struct AgentUiExpectation {
     present: Vec<AgentElementLocator>,
     #[serde(default)]
     absent: Vec<AgentElementLocator>,
+    /// Text that must be on screen, read by OCR from screenshots: for canvas
+    /// screens (games, Flutter/Unity) whose element tree has no labels. Each
+    /// entry matches a recognized line containing it, ignoring case and spaces.
+    #[serde(default)]
+    ocr_present: Vec<String>,
+    /// Text that must NOT be on screen (a loading caption), read by OCR.
+    #[serde(default)]
+    ocr_absent: Vec<String>,
+}
+
+impl AgentUiExpectation {
+    fn uses_ocr(&self) -> bool {
+        !self.ocr_present.is_empty() || !self.ocr_absent.is_empty()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -11245,14 +11263,36 @@ fn validate_agent_actions(request: &AgentActionsRequest) -> Result<(), String> {
                 timeout_ms,
                 poll_ms,
             } => {
-                if expect.application.is_none()
-                    && expect.present.is_empty()
-                    && expect.absent.is_empty()
-                {
+                let tree = expect.application.is_some()
+                    || !expect.present.is_empty()
+                    || !expect.absent.is_empty();
+                if !tree && !expect.uses_ocr() {
                     return Err(format!(
-                        "steps[{index}].expect must include application, present, or absent"
+                        "steps[{index}].expect must include application, present, absent, ocr_present, or ocr_absent"
                     ));
                 }
+                if tree && expect.uses_ocr() {
+                    return Err(format!(
+                        "steps[{index}].expect mixes element locators with ocr_present/ocr_absent; use two wait_for steps"
+                    ));
+                }
+                if expect
+                    .ocr_present
+                    .iter()
+                    .chain(expect.ocr_absent.iter())
+                    .any(|text| {
+                        crate::app_lookup::normalize(text).is_empty() || text.chars().count() > 200
+                    })
+                {
+                    return Err(format!(
+                        "steps[{index}] ocr_present/ocr_absent entries must be 1 to 200 characters of visible text"
+                    ));
+                }
+                let max_wait = if expect.uses_ocr() {
+                    AGENT_ACTIONS_MAX_OCR_WAIT_MS
+                } else {
+                    AGENT_ACTIONS_MAX_WAIT_MS
+                };
                 if expect
                     .application
                     .as_ref()
@@ -11270,9 +11310,9 @@ fn validate_agent_actions(request: &AgentActionsRequest) -> Result<(), String> {
                 {
                     return Err(format!("steps[{index}] contains an empty element locator"));
                 }
-                if *timeout_ms == 0 || *timeout_ms > AGENT_ACTIONS_MAX_WAIT_MS {
+                if *timeout_ms == 0 || *timeout_ms > max_wait {
                     return Err(format!(
-                        "steps[{index}].timeout_ms must be between 1 and {AGENT_ACTIONS_MAX_WAIT_MS}"
+                        "steps[{index}].timeout_ms must be between 1 and {max_wait}"
                     ));
                 }
                 if !(50..=1_000).contains(poll_ms) {
@@ -11423,6 +11463,142 @@ fn agent_expectation_observation(
 ///   read failed, so this is the last valid observation, not the current one.
 ///   A late failure must never erase the reads that did succeed.
 /// * `read:true` — the screen was read and the condition simply was not met.
+enum OcrWait {
+    Matched(serde_json::Value),
+    TimedOut(serde_json::Value),
+    Private,
+}
+
+/// Lines of recognized text a timed-out OCR wait reports, so the agent sees
+/// what IS on screen without another screenshot.
+const OCR_WAIT_REPORTED_LINES: usize = 20;
+
+/// Whether `needle` is in some recognized line, ignoring case and spacing
+/// (Vision may split or join CJK words with spaces).
+fn ocr_text_present(lines: &[String], needle: &str) -> bool {
+    let needle = crate::app_lookup::normalize(needle);
+    !needle.is_empty() && lines.iter().any(|line| line.contains(&needle))
+}
+
+/// `(matches, observation)` for one OCR read of the screen.
+fn ocr_expectation_observation(
+    texts: &[String],
+    expect: &AgentUiExpectation,
+) -> (bool, serde_json::Value) {
+    let lines: Vec<String> = texts.iter().map(|t| crate::app_lookup::normalize(t)).collect();
+    let present: Vec<serde_json::Value> = expect
+        .ocr_present
+        .iter()
+        .map(|text| serde_json::json!({"text": text, "seen": ocr_text_present(&lines, text)}))
+        .collect();
+    let absent: Vec<serde_json::Value> = expect
+        .ocr_absent
+        .iter()
+        .map(|text| serde_json::json!({"text": text, "seen": ocr_text_present(&lines, text)}))
+        .collect();
+    let matches = present.iter().all(|row| row["seen"] == true)
+        && absent.iter().all(|row| row["seen"] == false);
+    (
+        matches,
+        serde_json::json!({
+            "read": true,
+            "ocr_present": present,
+            "ocr_absent": absent,
+            "lines": texts.iter().take(OCR_WAIT_REPORTED_LINES).collect::<Vec<_>>(),
+            "line_count": texts.len(),
+        }),
+    )
+}
+
+/// One screenshot through the held runner client, recognized by Vision.
+async fn agent_ocr_read(
+    w: &mut crate::runner::RunnerClient,
+    deadline: tokio::time::Instant,
+) -> Result<Vec<String>, String> {
+    let read = async {
+        let (width, _) = w
+            .window_size()
+            .await
+            .map_err(|error| format!("screen size: {error:#}"))?;
+        let png = w
+            .screenshot_png()
+            .await
+            .map_err(|error| format!("screenshot: {error:#}"))?;
+        let pixels = png_width(&png).ok_or("the screenshot is not a PNG")?;
+        if width <= 0.0 {
+            return Err("the screen size is unknown".to_string());
+        }
+        let rows = crate::ocr::recognize(&png, f64::from(pixels) / width)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        Ok(rows.into_iter().map(|row| row.text).collect())
+    };
+    tokio::time::timeout_at(deadline, read)
+        .await
+        .map_err(|_| "the OCR read did not finish inside the wait window".to_string())?
+}
+
+/// Poll screenshots + OCR until the expectation's text conditions hold.
+/// Read-only: nothing is sent to the phone but screenshot requests.
+async fn agent_wait_ocr(
+    state: &AppState,
+    w: &mut crate::runner::RunnerClient,
+    expect: &AgentUiExpectation,
+    wait_deadline: tokio::time::Instant,
+    poll_ms: u64,
+) -> OcrWait {
+    let started = tokio::time::Instant::now();
+    let mut attempts = 0_u64;
+    let mut reads = 0_u64;
+    let mut last_observation = serde_json::Value::Null;
+    let mut last_error: Option<String>;
+    loop {
+        if state.screen_private_secs() > 0 {
+            return OcrWait::Private;
+        }
+        attempts += 1;
+        match agent_ocr_read(w, wait_deadline).await {
+            Ok(texts) => {
+                if state.screen_private_secs() > 0 {
+                    return OcrWait::Private;
+                }
+                reads += 1;
+                last_error = None;
+                let (matches, mut observation) = ocr_expectation_observation(&texts, expect);
+                observation["attempts"] = attempts.into();
+                observation["reads"] = reads.into();
+                observation["waited_ms"] =
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX).into();
+                if matches {
+                    return OcrWait::Matched(observation);
+                }
+                last_observation = observation;
+            }
+            Err(error) => last_error = Some(error),
+        }
+        if tokio::time::Instant::now() >= wait_deadline {
+            let mut observation = if last_observation.is_null() {
+                serde_json::json!({
+                    "read": false,
+                    "hint": "no screenshot was recognized; nothing here proves the text is absent"
+                })
+            } else {
+                last_observation
+            };
+            observation["source"] = "ocr".into();
+            observation["attempts"] = attempts.into();
+            observation["reads"] = reads.into();
+            if let Some(error) = last_error {
+                observation["read_error"] = error.into();
+            }
+            return OcrWait::TimedOut(observation);
+        }
+        let remaining = wait_deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(std::cmp::min(std::time::Duration::from_millis(poll_ms), remaining))
+            .await;
+    }
+}
+
 fn agent_wait_observation(
     last_observation: serde_json::Value,
     attempts: u64,
@@ -11746,11 +11922,14 @@ async fn agent_actions_inner(
     }
     // `launch_app {"app": …}` becomes a bundle before the first step runs, so
     // a name that does not resolve refuses the whole batch with nothing sent.
-    for step in &mut request.steps {
+    let mut launch_resolutions: Vec<(usize, serde_json::Value)> = Vec::new();
+    for (step_index, step) in request.steps.iter_mut().enumerate() {
         if let AgentActionStep::Action { action, .. } = step {
             fresh_launch_while_recording(&state, action);
-            if let Err(refusal) = resolve_launch_app_action(&state, action).await {
-                return refusal;
+            match resolve_launch_app_action(&state, action).await {
+                Ok(Some(resolved)) => launch_resolutions.push((step_index, resolved)),
+                Ok(None) => {}
+                Err(refusal) => return refusal,
             }
         }
     }
@@ -12190,6 +12369,37 @@ async fn agent_actions_inner(
                     batch_deadline,
                     wait_started + std::time::Duration::from_millis(*timeout_ms),
                 );
+                if expect.uses_ocr() {
+                    match agent_wait_ocr(&state, &mut w, expect, wait_deadline, *poll_ms).await {
+                        OcrWait::Matched(observation) => {
+                            step_results.push(serde_json::json!({
+                                "index": index,
+                                "kind": "wait_for",
+                                "ok": true,
+                                "source": "ocr",
+                                "observation": observation
+                            }));
+                            completed += 1;
+                            continue;
+                        }
+                        OcrWait::Private => {
+                            return private_batch_refusal(index, completed, applied_actions);
+                        }
+                        OcrWait::TimedOut(observation) => {
+                            return agent_actions_failure(
+                                StatusCode::CONFLICT,
+                                index,
+                                completed,
+                                applied_actions,
+                                "expectation_timeout",
+                                "not_sent",
+                                applied_actions == 0,
+                                &step_results,
+                                Some(observation),
+                            );
+                        }
+                    }
+                }
                 // Narrow probes are an optimization, not evidence. Reserve
                 // at least half the actual remaining window for full reads:
                 // a source read can take seconds, far longer than poll_ms.
@@ -12376,6 +12586,16 @@ async fn agent_actions_inner(
         let mut health = recover(state.runner_health.lock());
         health.up = true;
         health.actionable = true;
+    }
+    // A launch by name says which app it opened (a loose name may have
+    // matched "Idol Ludo Board" for "idol ludo").
+    for (step_index, resolved) in launch_resolutions {
+        if let Some(step) = step_results
+            .iter_mut()
+            .find(|step| step["index"].as_u64() == Some(step_index as u64))
+        {
+            step["resolved"] = resolved;
+        }
     }
     let mut result = serde_json::json!({
         "ok": true,
@@ -13539,6 +13759,31 @@ async fn agent_input(
     headers: HeaderMap,
     body: String,
 ) -> Response {
+    INPUT_LAUNCH_RESOLUTION
+        .scope(std::cell::RefCell::new(None), async move {
+            let response = agent_input_owned(state, Query(query), headers, body).await;
+            let Some(resolved) = INPUT_LAUNCH_RESOLUTION.with(|slot| slot.borrow_mut().take())
+            else {
+                return response;
+            };
+            let (response, json) = read_json_response(response).await;
+            let Some(mut json) = json.filter(serde_json::Value::is_object) else {
+                return response;
+            };
+            json["resolved"] = resolved;
+            let (mut parts, _) = response.into_parts();
+            parts.headers.remove(header::CONTENT_LENGTH);
+            Response::from_parts(parts, Body::from(json.to_string()))
+        })
+        .await
+}
+
+async fn agent_input_owned(
+    state: State<Arc<AppState>>,
+    Query(query): Query<AgentInputQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
     let Some(owner) = trusted_bearer_owner(&state, &headers) else {
         return agent_input_inner(state, Query(query), headers, body).await;
     };
@@ -13766,8 +14011,12 @@ async fn agent_input_inner(
     }
     let mut value = value;
     fresh_launch_while_recording(&state, &mut value);
-    if let Err(refusal) = resolve_launch_app_action(&state, &mut value).await {
-        return refusal;
+    match resolve_launch_app_action(&state, &mut value).await {
+        Ok(Some(resolved)) => {
+            let _ = INPUT_LAUNCH_RESOLUTION.try_with(|slot| *slot.borrow_mut() = Some(resolved));
+        }
+        Ok(None) => {}
+        Err(refusal) => return refusal,
     }
     // A blocked app, or a link scheme the owner has not allowed, is refused
     // before anything else runs (`crate::guard`).
@@ -17993,16 +18242,19 @@ async fn resolve_launch_app_name(
 /// Rewrite a `launch_app {"app": …}` action to the bundle it names, before
 /// any device lock is taken (a cold inventory read can take seconds). Other
 /// actions pass through untouched.
+///
+/// Returns what the name resolved to (`{app, name, bundle_id, match}`), so the
+/// result can say which app a loose name launched; `None` for other actions.
 async fn resolve_launch_app_action(
     state: &AppState,
     action: &mut serde_json::Value,
-) -> Result<(), Response> {
+) -> Result<Option<serde_json::Value>, Response> {
     if action.get("type").and_then(serde_json::Value::as_str) != Some("launch_app") {
-        return Ok(());
+        return Ok(None);
     }
     let Some(name) = action.get("app").and_then(serde_json::Value::as_str).map(str::to_string)
     else {
-        return Ok(());
+        return Ok(None);
     };
     let found = resolve_launch_app_name(state, &name).await?;
     if let Some(object) = action.as_object_mut() {
@@ -18012,7 +18264,22 @@ async fn resolve_launch_app_action(
             serde_json::Value::String(found.candidate.bundle_id.clone()),
         );
     }
-    Ok(())
+    Ok(Some(launch_resolution_json(&name, &found)))
+}
+
+fn launch_resolution_json(app: &str, found: &crate::app_lookup::Ranked) -> serde_json::Value {
+    serde_json::json!({
+        "app": app,
+        "name": found.candidate.name,
+        "bundle_id": found.candidate.bundle_id,
+        "match": if found.exact { "exact" } else { "partial" },
+    })
+}
+
+tokio::task_local! {
+    /// What `/agent/input`'s `launch_app {"app": …}` resolved to, read back by
+    /// [`agent_input`] to add `resolved` to the response.
+    static INPUT_LAUNCH_RESOLUTION: std::cell::RefCell<Option<serde_json::Value>>;
 }
 
 /// While recording, an app launch starts the app fresh (on its first screen),
@@ -22780,6 +23047,8 @@ mod tests {
                 enabled: None,
                 visible: None,
             }],
+            ocr_present: vec![],
+            ocr_absent: vec![],
         };
 
         let (matches, observation) = agent_expectation_observation(&rows, &expect);
@@ -22792,8 +23061,55 @@ mod tests {
             application: Some("聚焦".to_string()),
             present: vec![],
             absent: vec![],
+            ocr_present: vec![],
+            ocr_absent: vec![],
         };
         assert!(!agent_expectation_observation(&rows, &wrong_app).0);
+    }
+
+    #[test]
+    fn an_ocr_wait_matches_recognized_text_ignoring_case_and_spaces() {
+        let expect: AgentUiExpectation = serde_json::from_value(serde_json::json!({
+            "ocr_present": ["长按自动", "lv 3"],
+            "ocr_absent": ["Loading"]
+        }))
+        .unwrap();
+        assert!(expect.uses_ocr());
+        let loading = ["LOADING 42%".to_string(), "Lv3".to_string()];
+        let (matches, observation) = ocr_expectation_observation(&loading, &expect);
+        assert!(!matches);
+        assert_eq!(observation["ocr_present"][0]["seen"], false);
+        assert_eq!(observation["ocr_present"][1]["seen"], true);
+        assert_eq!(observation["ocr_absent"][0]["seen"], true);
+        assert_eq!(observation["lines"][0], "LOADING 42%");
+        // Vision split the CJK caption with a space; it still counts.
+        let board = ["长按 自动".to_string(), "LV 3".to_string(), "1,200".to_string()];
+        assert!(ocr_expectation_observation(&board, &expect).0);
+    }
+
+    #[test]
+    fn ocr_waits_are_validated() {
+        let check = |expect: serde_json::Value, timeout_ms: u64| {
+            let request: AgentActionsRequest = serde_json::from_value(serde_json::json!({
+                "steps": [{"kind": "wait_for", "expect": expect, "timeout_ms": timeout_ms}]
+            }))
+            .unwrap();
+            validate_agent_actions(&request)
+        };
+        // OCR text alone may wait longer than an element wait.
+        assert!(check(serde_json::json!({"ocr_present": ["长按自动"]}), 45_000).is_ok());
+        assert!(check(serde_json::json!({"ocr_absent": ["Loading"]}), 60_000).is_ok());
+        assert!(check(serde_json::json!({"ocr_present": ["x"]}), 60_001).is_err());
+        assert!(check(serde_json::json!({"present": [{"label": "OK"}]}), 45_000).is_err());
+        // Never mixed with element locators, never blank.
+        let mixed = check(
+            serde_json::json!({"ocr_present": ["a"], "present": [{"label": "OK"}]}),
+            5_000,
+        )
+        .unwrap_err();
+        assert!(mixed.contains("two wait_for steps"), "{mixed}");
+        assert!(check(serde_json::json!({"ocr_present": ["  "]}), 5_000).is_err());
+        assert!(check(serde_json::json!({}), 5_000).is_err());
     }
 
     #[test]
@@ -25487,7 +25803,16 @@ mod tests {
         block(async {
             let state = readiness_test_state();
             let mut action = serde_json::json!({"type":"launch_app","app":"设置"});
-            resolve_launch_app_action(&state, &mut action).await.unwrap();
+            let resolved = resolve_launch_app_action(&state, &mut action).await.unwrap();
+            assert_eq!(
+                resolved,
+                Some(serde_json::json!({
+                    "app": "设置",
+                    "name": resolved.as_ref().unwrap()["name"],
+                    "bundle_id": "com.apple.Preferences",
+                    "match": "exact",
+                }))
+            );
             assert_eq!(
                 action,
                 serde_json::json!({"type":"launch_app","bundle":"com.apple.Preferences"})
