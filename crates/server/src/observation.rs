@@ -130,8 +130,12 @@ pub fn redact_batch(value: Value) -> Value {
         .is_some_and(|steps| steps.iter().any(|step| step["kind"] == "wait_for"));
     if let Some(map) = safe.as_object_mut() {
         map.insert("ok".into(), false.into());
-        map.insert("error".into(), "screen_privacy_changed".into());
-        map.insert("retry_safe".into(), false.into());
+        // An explicit privacy refusal is already independent of screen
+        // contents. Keep its known no-write/retry verdict unchanged.
+        if map.get("error").and_then(Value::as_str) != Some("screen_private") {
+            map.insert("error".into(), "screen_privacy_changed".into());
+            map.insert("retry_safe".into(), false.into());
+        }
         // Batch progress and the failed-step position can also encode whether
         // a screen expectation matched. Applied-action receipts stay in steps.
         if has_wait { map.remove("completed"); }
@@ -181,6 +185,15 @@ mod tests {
 
 #[cfg(test)]
 mod wait_receipt_tests {
+    #[test]
+    fn explicit_private_refusal_keeps_the_known_no_write_verdict() {
+        let safe = super::redact_batch(serde_json::json!({
+            "ok":false,"error":"screen_private","applied_actions":0,"retry_safe":true,"steps":[]
+        }));
+        assert_eq!(safe["error"], "screen_private");
+        assert_eq!(safe["retry_safe"], true);
+        assert_eq!(safe["applied_actions"], 0);
+    }
     #[test]
     fn revoked_wait_verdict_is_not_an_action_acknowledgement() {
         let value = serde_json::json!({"ok":true,"applied_actions":1,"steps":[
