@@ -577,15 +577,16 @@ final class RunnerTests: XCTestCase {
 
   // MARK: - Gestures
 
-  /// Runs a synthesized gesture; when the private path is missing or fails, runs `fallback`
-  /// (public XCUICoordinate API, quiescence skipped) and reports which path acted.
+  /// Use the public path only when synthesis is unavailable before dispatch.
+  /// Any synthesis error stays uncertain; never replay a possibly delivered gesture.
   func gesture(
     _ name: String,
     synthesized: () -> String?,
     fallback: (XCUIApplication) -> Void
   ) throws -> HTTPResponse {
-    if let error = timed("Synthesize", synthesized) {
-      NSLog("ipu-runner: %@ synthesis failed, using XCUICoordinate: %@", name, error)
+    let backend = try GestureDelivery.run(name, synthesisAvailable: IPURBridge.eventSynthesisAvailable(),
+        synthesized: { timed("Synthesize", synthesized) }) {
+      NSLog("ipu-runner: %@ synthesis unavailable before dispatch, using XCUICoordinate", name)
       let application = foreground().application
       let issuesBefore = recordedIssues.count
       var exception: String?
@@ -594,14 +595,13 @@ final class RunnerTests: XCTestCase {
         IPURBridge.invalidateRequestCache()
       }
       if let exception {
-        throw RunnerError.failed("\(name) failed (synthesis: \(error); coordinate: \(exception))")
+        throw RunnerError.failed("\(name) coordinate outcome unknown: \(exception)")
       }
       if recordedIssues.count > issuesBefore {
-        throw RunnerError.failed("\(name) failed (synthesis: \(error); coordinate: \(recordedIssues.last!))")
+        throw RunnerError.failed("\(name) coordinate outcome unknown: \(recordedIssues.last!)")
       }
-      return .value(NSNull(), headers: ["X-IPU-Gesture": "xcui-coordinate"])
     }
-    return .value(NSNull(), headers: ["X-IPU-Gesture": "synthesized"])
+    return .value(NSNull(), headers: ["X-IPU-Gesture": backend])
   }
 
   func coordinate(_ application: XCUIApplication, _ point: CGPoint) -> XCUICoordinate {

@@ -4,6 +4,24 @@
 import CoreGraphics
 import Foundation
 
+/// A synthesis error may follow delivered input. Only capability absence,
+/// established before invoking synthesis, permits another implementation.
+enum GestureDelivery {
+  static func run(
+    _ name: String, synthesisAvailable: Bool,
+    synthesized: () -> String?, fallback: () throws -> Void
+  ) throws -> String {
+    guard synthesisAvailable else {
+      try fallback()
+      return "xcui-coordinate"
+    }
+    if let error = synthesized() {
+      throw RunnerError.failed("\(name) synthesis outcome unknown: \(error); no coordinate fallback attempted")
+    }
+    return "synthesized"
+  }
+}
+
 enum W3CActions {
   static func number(_ object: [String: Any], _ key: String) -> Double? {
     if let value = object[key] as? NSNumber { return value.doubleValue }
@@ -15,6 +33,20 @@ enum W3CActions {
   static let tapHold = 0.05
   /// The shortest hold an explicit pause between down and up gets.
   static let minimumHold = 0.01
+
+  /// Public tap fallback cannot preserve a hold, a delayed start or a drag.
+  static func coordinateTapPoint(_ paths: [[[String: Any]]]) -> CGPoint? {
+    guard paths.count == 1, paths[0].count == 2 else { return nil }
+    let down = paths[0][0], up = paths[0][1]
+    guard down["type"] as? String == "down", up["type"] as? String == "up",
+          up["explicitPointerUp"] as? Bool == true,
+          let x = number(down, "x"), let y = number(down, "y"),
+          let endX = number(up, "x"), let endY = number(up, "y"),
+          let start = number(down, "t"), let end = number(up, "t"),
+          [x, y, endX, endY, start, end].allSatisfy({ $0.isFinite }),
+          x == endX, y == endY, start == 0, end > 0, end <= tapHold else { return nil }
+    return CGPoint(x: x, y: y)
+  }
 
   /// Turns one W3C pointer source's `actions` into touch paths (one per down…up). Moves while the
   /// pointer is down keep their timed endpoints for XCTest to interpolate; a down…up with no time between them is held for
@@ -67,7 +99,9 @@ enum W3CActions {
       case "pointerUp", "pointerCancel":
         if let down = downAt {
           t = max(t, down + (t > down ? minimumHold : tapHold))
-          current.append(step("up", position, t))
+          var up = step("up", position, t)
+          up["explicitPointerUp"] = action["type"] as? String == "pointerUp"
+          current.append(up)
           paths.append(current)
           current = []
           downAt = nil
