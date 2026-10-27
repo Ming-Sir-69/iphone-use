@@ -85,7 +85,9 @@ fn responder(request: &str) -> String {
 }
 #[test]
 fn private_on_off_during_capture_stops_suffix_and_preserves_applied_prefix() {
-    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _ocr = Ocr::new();
     block(async {
         let started = Arc::new(tokio::sync::Notify::new());
@@ -130,7 +132,9 @@ fn private_on_off_during_capture_stops_suffix_and_preserves_applied_prefix() {
 }
 #[test]
 fn queued_ocr_body_withholds_text_without_erasing_tap_acknowledgement() {
-    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _ocr = Ocr::new();
     block(async {
         let png = base64::engine::general_purpose::STANDARD
@@ -154,8 +158,48 @@ fn queued_ocr_body_withholds_text_without_erasing_tap_acknowledgement() {
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["applied_actions"], 1);
         assert_eq!(body["steps"][0]["ok"], true);
+        assert!(
+            body["steps"][1].get("ok").is_none(),
+            "revoked waits cannot retain a success verdict"
+        );
         assert_eq!(body["observation_omitted"], true);
         assert_eq!(body["scope_changed"], "screen_privacy_changed");
+        assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE_BOARD"));
+    });
+}
+
+#[test]
+fn queued_element_wait_withholds_observation_but_preserves_action_receipt() {
+    block(async {
+        let runner = mock_runner(|request, _| {
+            Some((
+                Duration::ZERO,
+                if request.contains("/source") {
+                    json!({"value":{"type":"XCUIElementTypeApplication","label":"Owned","rect":{"x":0,"y":0,"width":390,"height":844},
+                    "children":[{"type":"XCUIElementTypeStaticText","label":"PRIVATE_BOARD","rect":{"x":1,"y":1,"width":100,"height":20}}]}}).to_string()
+                } else if request.contains("/elements ") {
+                    json!({"value":[{"ELEMENT":"E"}]}).to_string()
+                } else {
+                    responder(request)
+                },
+            ))
+        });
+        let state = build_state_with_runner(runner.url());
+        let reply=server::http::router(state.clone()).oneshot(Request::builder().method("POST").uri("/agent/actions")
+            .header("x-phone-owner","wait-fixture").header("x-phone-control","1").header("content-type","application/json")
+            .body(Body::from(json!({"observe":false,"steps":[
+                {"kind":"action","action":{"type":"tap","x":0.5,"y":0.5}},
+                {"kind":"wait_for","expect":{"present":[{"label":"PRIVATE_BOARD"}]},"timeout_ms":3000,"poll_ms":100}
+            ]}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(reply.status(), StatusCode::OK);
+        hold(state.clone(), true).await;
+        hold(state, false).await;
+        let bytes = reply.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["steps"][0]["ok"], true);
+        assert_eq!(body["applied_actions"], 1);
+        assert!(body["steps"][1].get("ok").is_none());
+        assert_eq!(body["observation_omitted"], true);
         assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE_BOARD"));
     });
 }

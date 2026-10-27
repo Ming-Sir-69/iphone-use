@@ -60,6 +60,9 @@ fn clean(value: &mut Value) {
         Value::Array(items) => items.iter_mut().for_each(clean),
         Value::Object(map) => {
             map.retain(|key, _| RECEIPT_KEYS.contains(&key.as_str()));
+            if map.get("kind").and_then(Value::as_str) == Some("wait_for") {
+                map.remove("ok");
+            }
             if let Some(detail) = map.get_mut("detail") {
                 if let Some(d) = detail.as_object_mut() {
                     d.retain(|key, _| {
@@ -155,5 +158,22 @@ mod tests {
             assert_eq!(safe["outcome"], "unknown");
             assert_eq!(safe["retry_safe"], false);
         }
+    }
+}
+
+#[cfg(test)]
+mod wait_receipt_tests {
+    #[test]
+    fn revoked_wait_verdict_is_not_an_action_acknowledgement() {
+        let value = serde_json::json!({"ok":true,"applied_actions":1,"steps":[
+            {"index":0,"kind":"action","ok":true},
+            {"index":1,"kind":"wait_for","ok":true,"observation":{"lines":["PRIVATE"]}}
+        ]});
+        let safe = super::redact(value, "screen_privacy_changed");
+        assert_eq!(safe["ok"], true);
+        assert_eq!(safe["applied_actions"], 1);
+        assert_eq!(safe["steps"][0]["ok"], true);
+        assert!(safe["steps"][1].get("ok").is_none());
+        assert!(!safe.to_string().contains("PRIVATE"));
     }
 }

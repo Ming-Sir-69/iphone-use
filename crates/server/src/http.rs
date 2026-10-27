@@ -11874,10 +11874,11 @@ async fn agent_actions(
 /// No screen text survives a privacy refusal, but prior dispatch counts and
 /// retry safety remain visible so an interrupted batch cannot be replayed.
 fn private_batch_refusal(index: usize, completed: usize, applied: usize) -> Response {
-    agent_actions_failure(
-        StatusCode::LOCKED, index, completed, applied, "screen_private",
-        "not_sent", applied == 0, &[], None,
-    )
+    private_batch_refusal_with_steps(index, completed, applied, &[])
+}
+fn private_batch_refusal_with_steps(index: usize, completed: usize, applied: usize, steps: &[serde_json::Value]) -> Response {
+    agent_actions_failure(StatusCode::LOCKED, index, completed, applied, "screen_private",
+        "not_sent", applied == 0, steps, None)
 }
 
 async fn agent_actions_inner(
@@ -11886,15 +11887,20 @@ async fn agent_actions_inner(
     body: String,
 ) -> Response {
     let generation = state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire);
-    let uses_ocr = serde_json::from_str::<AgentActionsRequest>(&body).ok().is_some_and(|request|
-        request.steps.iter().any(|step| matches!(step, AgentActionStep::WaitFor { expect, .. } if expect.uses_ocr())));
+    let observes_screen = serde_json::from_str::<AgentActionsRequest>(&body).ok().is_some_and(|request|
+        request.observe || request.steps.iter().any(|step| matches!(step, AgentActionStep::WaitFor { .. })));
     let mut response = agent_actions_generation(State(state.clone()), headers, body, generation).await;
-    if uses_ocr && !refused_as_unauthenticated(&response) {
+    if observes_screen && !refused_as_unauthenticated(&response) {
         response.extensions_mut().insert(BatchPrivacyFence {
             private_until: state.private_until.clone(), epoch: state.privacy_epoch.clone(), generation,
         });
     }
     response
+}
+
+fn batch_privacy_revoked(state: &AppState, observes_screen: bool, generation: u64) -> bool {
+    observes_screen && (screen_private_now(&state.private_until)
+        || state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire) != generation)
 }
 
 async fn agent_actions_generation(
@@ -11933,11 +11939,10 @@ async fn agent_actions_generation(
     if let Err(error) = validate_agent_actions(&request) {
         return agent_actions_invalid(error);
     }
-    let uses_ocr = request.steps.iter().any(|step| matches!(step, AgentActionStep::WaitFor { expect, .. } if expect.uses_ocr()));
     let observes_screen = request.observe || request.steps.iter().any(|step| {
         matches!(step, AgentActionStep::WaitFor { .. })
     });
-    if observes_screen && (state.screen_private_secs() > 0 || (uses_ocr && state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire) != privacy_generation)) {
+    if batch_privacy_revoked(&state, observes_screen, privacy_generation) {
         return private_batch_refusal(0, 0, 0);
     }
     // `launch_app {"app": …}` becomes a bundle before the first step runs, so
@@ -12042,8 +12047,8 @@ async fn agent_actions_generation(
     let mut applied_actions = 0_usize;
     let mut step_results = Vec::with_capacity(request.steps.len());
     for (index, step) in request.steps.iter().enumerate() {
-        if observes_screen && (state.screen_private_secs() > 0 || (uses_ocr && state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire) != privacy_generation)) {
-            return private_batch_refusal(index, completed, applied_actions);
+        if batch_privacy_revoked(&state, observes_screen, privacy_generation) {
+            return private_batch_refusal_with_steps(index, completed, applied_actions, &step_results);
         }
         if state.runner_lifecycle.is_transitioning()
             || state.released.load(std::sync::atomic::Ordering::Acquire)
@@ -12403,7 +12408,7 @@ async fn agent_actions_generation(
                             continue;
                         }
                         OcrWait::Private => {
-                            return private_batch_refusal(index, completed, applied_actions);
+                            return private_batch_refusal_with_steps(index, completed, applied_actions, &step_results);
                         }
                         OcrWait::TimedOut(observation) => {
                             return agent_actions_failure(
@@ -12438,8 +12443,8 @@ async fn agent_actions_generation(
                 let probes = if alert_only { None } else { wait_probe_predicates(expect) };
                 let mut probe_misses = 0_u64;
                 loop {
-                    if state.screen_private_secs() > 0 {
-                        return private_batch_refusal(index, completed, applied_actions);
+                    if batch_privacy_revoked(&state, observes_screen, privacy_generation) {
+                        return private_batch_refusal_with_steps(index, completed, applied_actions, &step_results);
                     }
                     attempts += 1;
                     // While the targets are not there yet, ask runner for just
@@ -12463,8 +12468,8 @@ async fn agent_actions_generation(
                     } else {
                         agent_wait_elements(&mut w, wait_deadline).await
                     };
-                    if state.screen_private_secs() > 0 {
-                        return private_batch_refusal(index, completed, applied_actions);
+                    if batch_privacy_revoked(&state, observes_screen, privacy_generation) {
+                        return private_batch_refusal_with_steps(index, completed, applied_actions, &step_results);
                     }
                     let rows = match read {
                         Ok(rows) => rows,
@@ -12597,8 +12602,8 @@ async fn agent_actions_generation(
         completed += 1;
     }
 
-    if observes_screen && (state.screen_private_secs() > 0 || (uses_ocr && state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire) != privacy_generation)) {
-        return private_batch_refusal(completed, completed, applied_actions);
+    if batch_privacy_revoked(&state, observes_screen, privacy_generation) {
+        return private_batch_refusal_with_steps(completed, completed, applied_actions, &step_results);
     }
     state.touch_activity();
     // A read-only wait (including /alert/text) proves no input capability.
@@ -12628,8 +12633,8 @@ async fn agent_actions_generation(
         let budget = std::time::Duration::from_millis(AGENT_INPUT_SETTLE_DEFAULT_MS);
         let (observed, report) =
             settle_and_read_elements(&mut w, budget, DEVICE_SETTLE_DEFAULT_CAP).await;
-        if state.screen_private_secs() > 0 {
-            return private_batch_refusal(completed, completed, applied_actions);
+        if batch_privacy_revoked(&state, observes_screen, privacy_generation) {
+            return private_batch_refusal_with_steps(completed, completed, applied_actions, &step_results);
         }
         if let Some((snapshot, rows)) = observed {
             let rows = Arc::new(rows);
@@ -12676,8 +12681,8 @@ async fn agent_actions_generation(
     }
     // A person can start a private hold while a read is in flight. Discard
     // every observation, including earlier step text, before returning it.
-    if observes_screen && (state.screen_private_secs() > 0 || (uses_ocr && state.privacy_epoch.load(std::sync::atomic::Ordering::Acquire) != privacy_generation)) {
-        return private_batch_refusal(completed, completed, applied_actions);
+    if batch_privacy_revoked(&state, observes_screen, privacy_generation) {
+        return private_batch_refusal_with_steps(completed, completed, applied_actions, &step_results);
     }
     agent_actions_json(StatusCode::OK, result)
 }
