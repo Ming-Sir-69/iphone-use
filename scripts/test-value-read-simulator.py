@@ -80,6 +80,20 @@ def main():
         expected='value-root-'+'字'*6015+'🙂';sha=hashlib.sha256(expected.encode()).hexdigest()
         assert before['sha256']==sha
         status,full=api({'identifier':'complete-field'})
+        observed=full.get('value')
+        result['full_read']={'http_status':status,'error':full.get('error'),'source':full.get('source'),
+            'complete':full.get('complete'),'truncated':full.get('truncated'),
+            'utf16_length':full.get('utf16_length'),'returned_utf16_length':full.get('returned_utf16_length'),
+            'value_type':type(observed).__name__,
+            'sha256':hashlib.sha256(observed.encode()).hexdigest() if isinstance(observed,str) else None,
+            'expected_sha256':sha}
+        if status!=200 or observed!=expected:
+            ids,_=drag.runner_call(args,'/elements',{'using':'predicate string','value':"identifier == 'complete-field'"})
+            element=ids['value'][0].get('ELEMENT') or ids['value'][0]['element-6066-11e4-a52e-4f735466cecf']
+            try:native,_=drag.runner_call(args,f'/element/{element}/value?complete=1&max_utf16=8192')
+            except urllib.error.HTTPError as error:native=json.load(error)
+            value=native.get('value',{})
+            result['native_diagnostic']={key:value.get(key) for key in ['error','message','source','complete','truncated','utf16_length','returned_utf16_length'] if isinstance(value,dict)}
         assert status==200 and full['value']==expected and full['complete'] is True and full['truncated'] is False, 'full AX value did not match App-owned seed'
         assert full['utf16_length']==len(expected.encode('utf-16-le'))//2
         result['cases'].append({'case':'full','sha256':sha,'utf16_length':full['utf16_length'],'passed':True})

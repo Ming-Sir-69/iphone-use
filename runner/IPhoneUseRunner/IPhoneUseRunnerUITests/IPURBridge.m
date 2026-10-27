@@ -466,7 +466,13 @@ static BOOL IPURUseRequestCache(void)
       [signature getArgumentTypeAtIndex:2][0] != '@' ||
       [signature getArgumentTypeAtIndex:3][0] != '@' ||
       [signature getArgumentTypeAtIndex:4][0] != '^' || [signature getArgumentTypeAtIndex:4][1] != '@') {
-    if (errorMessage) *errorMessage = @"full AX value selector shape unavailable";
+    if (errorMessage) {
+      *errorMessage = signature.numberOfArguments == 5
+        ? [NSString stringWithFormat:@"full AX value selector shape unavailable (return=%s, arg2=%s, arg3=%s, arg4=%s)",
+           signature.methodReturnType, [signature getArgumentTypeAtIndex:2],
+           [signature getArgumentTypeAtIndex:3], [signature getArgumentTypeAtIndex:4]]
+        : @"full AX value selector argument count unavailable";
+    }
     return nil;
   }
   NSError *error = nil;

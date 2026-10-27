@@ -306,7 +306,7 @@ extension RunnerTests {
     }
     var error: NSString?
     guard let result = IPURBridge.readValue(for: ax, maxUTF16: UInt(limit), placeholder: node.placeholder, error: &error) else {
-      throw RunnerError.unsupported("full AX value read unavailable")
+      throw RunnerError.unsupported(error.map { String($0) } ?? "full AX value read unavailable")
     }
     IPURBridge.invalidateRequestCache()
     let after = try freshNode(id)
