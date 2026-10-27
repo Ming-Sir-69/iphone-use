@@ -22,8 +22,11 @@ pub const SOURCE: &str = include_str!("../../../scripts/ocr/ocr.swift");
 /// Rows Vision is less sure of than this are dropped.
 pub const MIN_CONFIDENCE: f64 = 0.3;
 
-/// One recognition run on one screenshot.
-pub const RUN_TIMEOUT: Duration = Duration::from_secs(10);
+/// One recognition run on one screenshot. A warm run takes well under a
+/// second, but the first run after Vision's models were evicted took 20–46 s
+/// on a busy Mac (measured on i13, v0.26.1): a 10 s cap killed every cold run,
+/// so the models never warmed and every OCR read failed.
+pub const RUN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A cold `swiftc -O` of the helper takes several seconds; allow headroom.
 const COMPILE_TIMEOUT: Duration = Duration::from_secs(180);

@@ -11542,8 +11542,13 @@ async fn agent_ocr_read(
         if width <= 0.0 {
             return Err("the screen size is unknown".to_string());
         }
-        let rows = crate::ocr::recognize(&png, f64::from(pixels) / width)
+        // Detached: when the wait window ends first, a cold recognizer keeps
+        // running to completion and warms Vision for the next read instead
+        // of being killed half-way.
+        let scale = f64::from(pixels) / width;
+        let rows = tokio::spawn(async move { crate::ocr::recognize(&png, scale).await })
             .await
+            .map_err(|error| format!("OCR task: {error}"))?
             .map_err(|error| format!("{error:#}"))?;
         Ok(rows.into_iter().map(|row| row.text).collect())
     };
@@ -20475,9 +20480,18 @@ async fn elements_ocr(
         .map_err(|error| format!("read the screenshot: {error}"))?;
     let pixels = png_width(&png).ok_or("the screenshot is not a PNG")?;
     let scale = f64::from(pixels) / width;
-    let rows = tokio::time::timeout(ELEMENTS_OCR_TIMEOUT, crate::ocr::recognize(&png, scale))
+    // Detached, like the OCR wait: a cold run that outlives this read still
+    // finishes and warms Vision for the next one.
+    let task = tokio::spawn(async move { crate::ocr::recognize(&png, scale).await });
+    let rows = tokio::time::timeout(ELEMENTS_OCR_TIMEOUT, task)
         .await
-        .map_err(|_| format!("OCR did not finish in {} s", ELEMENTS_OCR_TIMEOUT.as_secs()))?
+        .map_err(|_| {
+            format!(
+                "OCR did not finish in {} s (the first run after Vision was idle can be slow; retry)",
+                ELEMENTS_OCR_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|error| format!("OCR task: {error}"))?
         .map_err(|error| format!("{error:#}"))?;
     Ok(crate::ocr::rows_for_elements(&rows))
 }
