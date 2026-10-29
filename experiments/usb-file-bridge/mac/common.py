@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicit, one-file, wired-only CoreDevice inbox experiment (no clipboard access)."""
+"""Shared lease, transport, integrity, and atomic-publication helpers."""
 import argparse
 import contextlib
 import fcntl
@@ -174,19 +174,6 @@ class Device:
                       '--domain-identifier', self.args.bundle, '--source', str(source),
                       '--destination', str(destination), '--timeout', '15'])
 
-    def latest(self, path):
-        self.copy('from', 'Documents/latest.json', path)
-        value = read_json(path)
-        if not isinstance(value, dict) or value.get('version') != 1:
-            raise TransferError('Launch the inbox app once to initialize its versioned manifest')
-        return value
-
-    def ack(self, receipt):
-        path = self.scratch / 'ack.json'
-        # Do not copy local filesystem paths or diagnostic output back to the phone.
-        atomic_json(path, {k: receipt[k] for k in ('id', 'name', 'bytes', 'sha256')})
-        self.guard()
-        self.copy('to', path, 'Documents/receipt.json')
 
 def commit_file(source, meta, destination, session, guard):
     destination.mkdir(parents=True, exist_ok=True)
@@ -216,52 +203,11 @@ def commit_file(source, meta, destination, session, guard):
     finally:
         stage.unlink(missing_ok=True)
 
-def receive(args, session, device, scratch, emit):
-    device.guard()
-    baseline = device.latest(scratch / 'before.json').get('id')
-    emit({'event': 'armed', 'route': 'usb'})
-    while True:
-        session.check()
-        device.guard()
-        latest = device.latest(scratch / 'latest.json')
-        if latest.get('id') and latest['id'] != baseline:
-            meta = validate_manifest(latest, args.max_bytes)
-            break
-        time.sleep(min(0.5, session.check()))
-    manifest = scratch / 'manifest.json'
-    prefix = 'Documents/Transfers/' + meta['id']
-    device.copy('from', prefix + '/manifest.json', manifest)
-    if validate_manifest(read_json(manifest), args.max_bytes) != meta:
-        raise TransferError('Immutable manifest differs from latest pointer')
-    payload = scratch / 'payload'
-    device.copy('from', prefix + '/payload', payload)
-    if digest_file(payload, args.max_bytes) != (meta['bytes'], meta['sha256']):
-        raise TransferError('Phone/Mac integrity mismatch')
-    if args.expect_sha256 and meta['sha256'] != args.expect_sha256:
-        raise TransferError('Received file differs from expected SHA-256')
-    target, result = commit_file(payload, meta, args.destination, session, device.guard)
-    receipt = {**meta, 'event': 'received', 'committed': True, 'result': result,
-               'destination': str(target.resolve()), 'transport': 'wired', 'clipboard_used': False}
-    # Commit is irreversible: later acknowledgement errors must not report a failed copy.
-    try:
-        device.ack(receipt)
-        receipt['phone_ack'] = True
-    except Exception as error:
-        receipt.update(phone_ack=False, phone_ack_error=str(error))
-    try:
-        receipts = session.root / 'receipts'
-        receipts.mkdir(exist_ok=True, mode=0o700)
-        atomic_json(receipts / (meta['id'] + '.json'), receipt)
-    except Exception as error:
-        receipt['receipt_error'] = str(error)
-    emit(receipt)
-    return receipt
-
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('action', choices=['receive', 'status', 'stop'])
     p.add_argument('--device', required=True, help='Exact UDID; must match the iPhone Use instance')
-    p.add_argument('--bundle', required=True, help='Bundle identifier used to sign/install the inbox app')
+    p.add_argument('--bundle', required=True, help='Exact installed XCTest runner bundle identifier')
     p.add_argument('--instance', default='default')
     p.add_argument('--owner', default=os.environ.get('IPHONE_USE_OWNER'), help='Exact caller control lease owner; required for receive')
     p.add_argument('--destination', type=Path)
@@ -270,44 +216,3 @@ def parser():
     p.add_argument('--max-bytes', type=int, default=64 * 1024 * 1024)
     p.add_argument('--expect-sha256')
     return p
-
-def main(argv=None):
-    p = parser()
-    args = p.parse_args(argv)
-    if not 1 <= args.timeout <= 3600 or not 0 <= args.max_bytes <= 64 * 1024 * 1024:
-        p.error('timeout must be 1–3600 seconds; max-bytes 0–67108864')
-    if args.expect_sha256 and not re.fullmatch('[0-9a-f]{64}', args.expect_sha256):
-        p.error('expect-sha256 must contain 64 lowercase hex digits')
-    key = hashlib.sha256(json.dumps([args.device, args.bundle, args.instance]).encode()).hexdigest()[:24]
-    root = args.state_dir.expanduser() / key
-    emit = lambda value: print(json.dumps(value, ensure_ascii=False), flush=True)
-    if args.action == 'status':
-        emit(Session.status(root)); return
-    if args.action == 'stop':
-        emit({'cancel_requested': Session.cancel(root), 'system_clipboard': 'unchanged'}); return
-    if not args.destination or not args.owner:
-        p.error('receive requires --destination and --owner (or IPHONE_USE_OWNER)')
-    args.destination = args.destination.expanduser().resolve()
-    session = Session(root, args.timeout)
-    def cancelled(*_):
-        raise Cancelled('USB receive interrupted')
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, cancelled)
-    acquired = False
-    try:
-        with session.acquire():
-            acquired = True
-            with tempfile.TemporaryDirectory(prefix='receive-', dir=root) as temp:
-                scratch = Path(temp)
-                receive(args, session, Device(args, session, scratch), scratch, emit)
-    finally:
-        if acquired:
-            emit({'event': 'session-ended', 'system_clipboard': 'unchanged',
-                  'receiver': Session.status(root)})
-
-if __name__ == '__main__':
-    try:
-        main()
-    except Exception as error:
-        print(json.dumps({'event': 'error', 'detail': str(error), 'system_clipboard': 'unchanged'}), file=sys.stderr)
-        sys.exit(1)

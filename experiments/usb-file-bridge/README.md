@@ -1,114 +1,113 @@
-# USB file inbox experiment
+# USB file handoff through the existing Runner
 
-An explicit iPhone → Mac file handoff when Universal Clipboard does not sync.
-The user (or an authorized agent) shares a document into a small signed iOS app;
-a one-shot Mac receiver pulls that app's own payload through CoreDevice and
-verifies its size and SHA-256 before publishing a local file.
+Reuse **iPhoneUse-Runner**, its existing icon, and iOS's native **Save to Files**
+UI. No additional iPhone app, custom transfer screen, clipboard access, or
+Handoff toggle is required. The Mac side receives an explicitly selected saved
+file from the runner's own Documents container through CoreDevice.
 
-This is an opt-in experiment, **not** a new daemon endpoint, MCP tool, background
-clipboard synchronizer, or production release feature. It does not change
-Handoff, read either clipboard, or read another app's private container.
+This is an opt-in experiment, not a released MCP endpoint or automatic change
+to runner setup. The earlier standalone-app prototype has been removed from
+this proposal. The XCTest test-host delegate and control loop are unchanged.
 
-## Requirements and build
+## Enable the native Files entry (development setup)
 
-- macOS with Xcode/CoreDevice, XcodeGen, Python 3.9+, and an installed `iphone-use` CLI.
-- A paired, unlocked iPhone, connected by USB; iOS 17+ for this app.
-- Your own development signing team and unique bundle identifier. No credentials,
-  certificates, device identifiers or provisioning profiles are included here.
-
-From this directory:
+Xcode generates the `.xctrunner` application. Setting plist keys on the nested
+UI-test bundle does not enable file sharing on that outer app. This helper
+stages a copy of an already signed outer runner, adds `UIFileSharingEnabled`
+and `LSSupportsOpeningDocumentsInPlace`, and re-signs its outer seal using the
+same identity and entitlements. It verifies signatures before and after,
+preserves the original icon/nested code, and never modifies its source.
 
 ```sh
-DEVICE_UDID='<your-udid>' TEAM_ID='<your-team>' BUNDLE_ID='<your-bundle-id>' \
-  bash build-install.sh
+python3 mac/enable_runner_files.py \
+  --source '/absolute/path/to/iPhoneUse-Runner.app' \
+  --output '/absolute/new/path/iPhoneUse-Runner.app'
 ```
 
-Launch **USB File Bridge** once to initialize its versioned inbox. The build
-script generates the Xcode project and uses your existing Xcode account; it does
-not sign in or resolve trust prompts. Personal-team provisioning expires and
-requires rebuilding. Installing with an identifier used by another app replaces
-that app, so choose a dedicated identifier.
+Use the existing Xcode development identity. While the managed runner is
+paused, back up its cached product, make the verified staged app the product
+used for `test-without-building`, install it with `devicectl`, and resume using
+the normal iPhone Use supervisor. Keep a backup for rollback. This deployment
+is deliberately explicit: the experiment does not rewrite the supervisor,
+install another app, or change signing accounts. A subsequent rebuild/upgrade
+can clear these flags; integration into the normal setup/signing/cache pipeline
+is still needed before this becomes a persistent product feature.
 
-## Receive one file
+The keys expose the runner's **whole Documents directory**, not only the inbox,
+to the user's native Files/Finder file-sharing UI. Do not store tokens or other
+internal secrets in Documents. No new network file server is started.
 
-1. Use the normal iPhone Use session to select and verify the source document.
-   Check `phone_status` for `drivable`, the exact device UDID, and your control
-   lease's `owner`. Do not borrow another caller's owner value.
-2. Start this command in a background terminal/task and wait for `event=armed`:
+Create an inbox folder (for example `Documents/Send to Mac`) in the runner's
+container with CoreDevice. Its exact bundle ID is the installed team-derived
+`.xctrunner` ID, not the nested test bundle ID. The native path is:
+
+**Files → On My iPhone → iPhoneUse-Runner → Send to Mac**
+
+Optionally favorite the folder. The local Chinese-language validation used
+“发送到 Mac”; a favorite is also available from the native save picker.
+
+## Receive a file after saving
+
+1. Obtain your normal iPhone Use control lease. Confirm its exact owner, UDID,
+   instance and wired connection. Do not borrow another caller's owner.
+2. In the source app, use the system share menu → **Save to Files**, select the
+   runner inbox, and finish saving. Confirm the dialog completed and note the
+   exact filename. This is not an automatic “latest file” selector: old files
+   remain until the user removes them.
+3. Run the receiver using your actual device/bundle/owner values:
 
    ```sh
-   python3 mac/receive.py receive \
-     --device '<exact-udid>' --bundle '<your-bundle-id>' \
+   python3 mac/runner_files.py receive \
+     --device '<exact-udid>' --bundle '<installed-runner-id>.xctrunner' \
      --instance default --owner '<your-session-owner>' \
-     --destination '/absolute/output/directory' --timeout 180
+     --folder 'Documents/Send to Mac' --filename '<exact-saved-name.pdf>' \
+     --destination '/absolute/output/directory'
    ```
 
-   `IPHONE_USE_OWNER` can supply `--owner`. `--state-dir` relocates local runtime
-   state; by default it is under `~/.iphone-use/usb-file-bridge`. Instance, UDID
-   and bundle form the lock scope. Optional `--expect-sha256` verifies a known
-   sample. The default and maximum payload limit is 64 MiB.
-3. On the phone, use the document's system share/Open In menu and choose
-   **USB File Bridge** (possibly under More). Do not choose Copy. In QQ Mail,
-   the tested entry is invoice detail → Share → Open in another app.
-4. Wait for `event=received`, `committed=true`. The phone receives a separate
-   acknowledgement; `phone_ack=false` means the local file still committed but
-   the phone has not confirmed receipt. The UI never treats import alone as
-   transfer success.
+`IPHONE_USE_OWNER` can supply `--owner`. `--expect-sha256` optionally checks a
+known sample. Maximum/default payload limit is 64 MiB. `--state-dir` relocates
+runtime state from `~/.iphone-use/usb-file-bridge`.
 
-Commands use the same device/bundle/instance/state-dir arguments:
+The receiver lists the exact saved file, verifies size/type, reads it twice with
+stable metadata checks, compares both SHA-256 values, and atomically publishes
+without overwriting a different destination. **Hashing is on the Mac**; this
+version does not add an on-phone hashing service. Two stable reads cannot prove
+an arbitrary writer has finished; invoke only after the native save completed.
+There is no separate phone-side receipt UI: the native file and the Mac's
+`committed=true` result are the visible outcomes.
 
 ```sh
-python3 mac/receive.py status --device '<udid>' --bundle '<bundle>'
-python3 mac/receive.py stop   --device '<udid>' --bundle '<bundle>'
+python3 mac/runner_files.py status --device '<udid>' --bundle '<runner>.xctrunner'
+python3 mac/runner_files.py stop   --device '<udid>' --bundle '<runner>.xctrunner'
 ```
 
-`stop` requests cooperative cancellation using the active session token. It
-never signals a PID from a stale file. `status.active` uses an OS lock rather
-than PID existence. Agents should select **one** route per task: while this
-receiver is active, do not also run a clipboard-export flow. The experiment
-cannot prevent a person or unrelated tool from independently copying content.
+Use the same instance/state-dir for each command. `stop` uses a session token,
+not a stale PID. An OS lock scopes exclusivity by UDID/bundle/instance. Agents
+should select one route per task and avoid clipboard-export flows while a USB
+receiver is active. Apple clipboard settings remain unchanged throughout;
+there is no global switch to restore after cancellation or disconnection.
 
-## Guarantees and limits
+## Boundaries
 
-- The exact iPhone Use owner and target UDID are checked, and CoreDevice must
-  report `wired` before and after payload download and before file commit.
-  CoreDevice selects the underlying transport: these are checkpoint checks,
-  not a transport lock or proof that a cable cannot change between checks.
-- Owner loss, a connection error, explicit cancellation, or the deadline ends
-  the receiver. Device subprocesses are bounded by the remaining deadline and
-  a 15-second command cap. Handoff settings are unchanged throughout, so there
-  is no global setting to restore after disconnection or process failure.
-- A baseline transfer ID prevents an existing inbox item from becoming a new
-  result. Payload and immutable manifest precede the atomic latest pointer.
-  Phone imports are serialized. This is **one file at a time**, not a queue;
-  wait for each receipt before sharing another file.
-- File names, IDs, manifest size, byte count and digest are validated. Payload
-  hashing/copying is chunked. Destination staging is private (0600), flushed,
-  checked and atomically linked without overwrite. Existing identical content
-  at the same path is accepted; a different file or symlink is refused.
-- Acknowledgement or receipt-log failures after commit are explicitly reported
-  as post-commit warnings. Full local destination paths are not sent back to
-  the phone. No clipboard cache or invoice is a test fixture in this repository.
-- The iOS app retains imported documents and receipts in its sandbox for
-  inspection. There is no automatic cleanup/retention UI yet. Repeated shares
-  may receive an iOS-added filename suffix; cross-name content deduplication,
-  large queues, wireless transport, and production lifecycle integration are
-  out of scope.
+- Owner, target UDID and CoreDevice `wired` transport are checked repeatedly and
+  before commit. CoreDevice controls the underlying route: checkpoints are not
+  a transport lock and do not prove a cable cannot change between checks.
+- Commands are bounded by the remaining deadline and a 15-second command cap.
+  Owner loss, cancellation and connection errors abort before publication.
+- Paths, names, file type, size, stable metadata and read digests are checked.
+  Publication uses a flushed private (0600) staging file and a non-overwriting
+  atomic hard link. An identical existing file is idempotent; symlinks and
+  different content are refused. Receipts stay on the Mac.
+- Exact-file selection avoids silently substituting another file. Queues,
+  automatic cleanup, wireless transport and production setup integration are
+  not implemented. Files remain in the user's runner inbox for inspection.
 
 ## Tests
 
 ```sh
 python3 -m unittest discover -s tests -v
-bash -n build-install.sh
 ```
 
-The hardware results and untested boundaries are in [VALIDATION.md](VALIDATION.md).
-Tests use fake device operations for failure paths; they do not require a phone
-or access any private documents.
-
-For repeatable Debug hardware tests, copy a synthetic file to
-`Documents/Fixtures/<basename>` in this app's container, arm the receiver, then
-launch with `--usb-bridge-fixture <basename>`. This Debug-only hook invokes the
-same importer, restricts its input to that directory, and is absent in Release.
-A real share-menu test is still required separately; the hook does not test iOS
-sharing UI. Use only synthetic files when publishing test evidence.
+See [VALIDATION.md](VALIDATION.md) for the current Runner-native hardware checks.
+No invoices, account/device identifiers, signing material or machine-specific
+paths are included in this contribution.
