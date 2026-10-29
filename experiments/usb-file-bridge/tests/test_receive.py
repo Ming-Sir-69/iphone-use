@@ -73,6 +73,75 @@ class DeviceTests(unittest.TestCase):
                     else:
                         with self.assertRaises(b.TransferError):dev.guard()
 
+    def test_lease_change_during_transport_probe_is_rejected(self):
+        changes = ({'owner': 'new-owner'}, {'owner': None},
+                   {'udid': 'other-phone'}, {'drivable': False})
+        for change in changes:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                state = {'drivable': True, 'owner': 'me', 'udid': 'phone'}
+                args = types.SimpleNamespace(device='phone', owner='me', instance='default')
+                device = b.Device(args, b.Session(root, 10), root)
+                def command(argv, *rest):
+                    if argv[0] == 'iphone-use':
+                        return json.dumps(state)
+                    state.update(change)  # Ownership changes while the blocking probe runs.
+                    (root/'device.json').write_text(json.dumps({
+                        'result': {'connectionProperties': {'transportType': 'wired'}}}))
+                    return ''
+                with patch.object(device, 'command', side_effect=command):
+                    with self.assertRaises(b.TransferError):
+                        device.guard()
+
+    def test_commit_rechecks_real_guard_after_transport_probe(self):
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                source = root/'source'
+                source.write_bytes(b'file bytes')
+                dest = root/'output'
+                dest.mkdir()
+                target = dest/'invoice.pdf'
+                if existing:
+                    target.write_bytes(source.read_bytes())
+                state = {'drivable': True, 'owner': 'me', 'udid': 'phone'}
+                args = types.SimpleNamespace(device='phone', owner='me', instance='default')
+                session = b.Session(root/'state', 10)
+                device = b.Device(args, session, root)
+                def command(argv, *rest):
+                    if argv[0] == 'iphone-use':
+                        return json.dumps(state)
+                    state['owner'] = 'new-owner'
+                    (root/'device.json').write_text(json.dumps({
+                        'result': {'connectionProperties': {'transportType': 'wired'}}}))
+                    return ''
+                with session.acquire(), patch.object(device, 'command', side_effect=command):
+                    with self.assertRaises(b.TransferError):
+                        b.commit_file(source, metadata(), dest, session, device.guard)
+                self.assertEqual(target.exists(), existing)
+                if existing:
+                    self.assertEqual(target.read_bytes(), b'file bytes')
+                self.assertEqual(list(dest.glob('*.partial')), [])
+                self.assertFalse(b.Session.status(session.root)['active'])
+
+    def test_copy_boundary_checks_lease_before_device_access(self):
+        for change in ({'owner': 'new-owner'}, {'udid': 'other-phone'}, {'drivable': False}):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                state = {'drivable': True, 'owner': 'me', 'udid': 'phone', **change}
+                args = types.SimpleNamespace(device='phone', owner='me', instance='default', bundle='test.xctrunner')
+                device = b.Device(args, b.Session(root, 10), root)
+                operations = []
+                def command(argv, *rest):
+                    if argv[0] == 'iphone-use':
+                        return json.dumps(state)
+                    operations.append(argv)
+                    return ''
+                with patch.object(device, 'command', side_effect=command):
+                    with self.assertRaises(b.TransferError):
+                        device.copy('from', 'Documents/sample.pdf', root/'received')
+                self.assertEqual(operations, [])
+
     def test_command_timeout_bounded_and_cancel_checked(self):
         with tempfile.TemporaryDirectory() as d:
             session=b.Session(Path(d),2)

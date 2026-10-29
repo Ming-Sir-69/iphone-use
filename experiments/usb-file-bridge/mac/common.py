@@ -154,12 +154,15 @@ class Device:
             raise TransferError(result.stderr.strip() or result.stdout.strip() or 'Device command failed')
         return result.stdout
 
-    def guard(self):
+    def check_lease(self):
         state = json.loads(self.command(['iphone-use', 'status', '--instance', self.args.instance, '--json'], 10))
         if not state.get('drivable') or state.get('owner') != self.args.owner:
             raise TransferError('iPhone Use control lease ended or belongs to another caller')
         if state.get('udid') != self.args.device:
             raise TransferError('iPhone Use instance targets a different UDID')
+
+    def guard(self):
+        self.check_lease()
         path = self.scratch / 'device.json'
         self.command(['xcrun', 'devicectl', 'device', 'info', 'details', '--device', self.args.device,
                       '--timeout', '10', '--json-output', str(path)])
@@ -167,8 +170,13 @@ class Device:
         conn = obj.get('connectionProperties') or obj.get('properties', {}).get('connection', {})
         if conn.get('transportType') != 'wired':
             raise TransferError('Wired transport required; refusing wireless fallback')
+        # Transport discovery blocks: its original lease observation may be stale.
+        # Keep this as the final check before callers copy or publish a file.
+        self.check_lease()
 
     def copy(self, direction, source, destination):
+        # Metadata reads/hashing since the caller's last guard can also block.
+        self.check_lease()
         self.command(['xcrun', 'devicectl', 'device', 'copy', direction,
                       '--device', self.args.device, '--domain-type', 'appDataContainer',
                       '--domain-identifier', self.args.bundle, '--source', str(source),

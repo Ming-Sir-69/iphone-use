@@ -89,8 +89,8 @@ there is no global switch to restore after cancellation or disconnection.
 
 ## Boundaries
 
-- Owner, target UDID and CoreDevice `wired` transport are checked repeatedly and
-  before commit. CoreDevice controls the underlying route: checkpoints are not
+- Owner and target UDID are checked before and after the blocking CoreDevice
+  `wired` probe, immediately before each device copy, and before commit. CoreDevice controls the underlying route: checkpoints are not
   a transport lock and do not prove a cable cannot change between checks.
 - Commands are bounded by the remaining deadline and a 15-second command cap.
   Owner loss, cancellation and connection errors abort before publication.

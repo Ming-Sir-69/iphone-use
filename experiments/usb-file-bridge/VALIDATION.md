@@ -20,7 +20,7 @@ Based on upstream `a1355ab`. Private identifiers and source documents are omitte
 - No Copy action, pasteboard API, shared-pasteboard cache or Handoff-setting
   change was used. Hashes are computed on the Mac, not inside the runner.
 
-`python3 -m unittest discover -s tests -v`: **22 tests passed**. Coverage includes
+`python3 -m unittest discover -s tests -v`: **25 tests passed**. Coverage includes
 actual CLI errors/status, cancellation/locks/stale state, lease/UDID/wireless
 checks, deadlines, path/metadata/size validation, two-read disagreement, source
 changes, expected digest, idempotency, symlinks, non-overwriting publication
@@ -43,3 +43,19 @@ and persistence through an official rebuild/upgrade remain untested. Native
 Save must finish before reception; two stable snapshots alone cannot establish
 completion of an unrelated asynchronous writer. This remains a draft experiment
 pending setup/signing/cache integration review.
+
+## Owner-loss regression (review follow-up)
+
+The reviewer reproduced an owner change during the blocking CoreDevice
+transport probe. The new tests failed against the prior code (including actual
+`commit_file` calls with the real guard), then passed with the fix. Lease checks
+now run after transport discovery and immediately before each device copy.
+Cases include owner replacement/release, target UDID change, loss of drivable
+state, fresh destination publication, and an existing identical destination.
+Aborted publication leaves no new target or staging file and releases its lock.
+These are offline regressions; no additional phone access was needed.
+
+This closes the reproduced blocking-probe window, not every possible race:
+a status observation is not an atomic lease held across a device subprocess or
+filesystem publication. A daemon-native transaction is still required for that
+stronger guarantee.
