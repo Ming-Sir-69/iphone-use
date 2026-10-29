@@ -7,6 +7,7 @@ import sys
 import tempfile
 import uuid
 import common as core
+import publication
 
 def relative_folder(value):
     parts = PurePosixPath(value).parts
@@ -61,12 +62,15 @@ def receive_saved(args, session, device, scratch, emit):
         raise core.TransferError('Source changed or USB reads differ')
     if args.expect_sha256 and one[1] != args.expect_sha256:
         raise core.TransferError('Expected SHA-256 mismatch')
-    meta = {'version':1, 'id':str(uuid.uuid4()), 'name':args.filename, 'bytes':one[0], 'sha256':one[1]}
+    meta = {'version':1, 'id':getattr(args, 'transfer_id', None) or str(uuid.uuid4()), 'name':args.filename, 'bytes':one[0], 'sha256':one[1]}
     core.validate_manifest(meta, args.max_bytes)
     target, result = core.commit_file(first, meta, args.destination, session, device.guard)
     receipt = {**meta,'event':'received','committed':True,'result':result,'destination':str(target),
                'transport':'wired','clipboard_used':False,'receiver_app':'existing-xctest-runner',
                'verification':'remote-size-and-two-stable-reads','sha256_origin':'mac'}
+    receipt['transfer_id'] = meta['id']
+    if getattr(session, 'publication_warning', None):
+        receipt['publication_warning'] = session.publication_warning
     try:
         logs = session.root/'receipts';logs.mkdir(exist_ok=True,mode=0o700)
         core.atomic_json(logs/(meta['id']+'.json'),receipt)
@@ -78,6 +82,7 @@ def receive_saved(args, session, device, scratch, emit):
 def main():
     p = core.parser()
     p.description = __doc__
+    p.add_argument('--transfer-id', help='UUID for result reconciliation; reuse only to query result')
     p.add_argument('--folder', default='Documents/Send to Mac')
     p.add_argument('--filename', help='Exact filename selected only AFTER the native Save dialog completed')
     args = p.parse_args()
@@ -89,6 +94,9 @@ def main():
     key = core.hashlib.sha256(json.dumps([args.device,args.bundle,args.instance]).encode()).hexdigest()[:24]
     root = args.state_dir.expanduser()/key
     emit = lambda data: print(json.dumps(data,ensure_ascii=False),flush=True)
+    if args.action == 'result':
+        if not args.transfer_id: p.error('result requires --transfer-id')
+        emit(publication.reconcile(root, args.transfer_id));return
     if args.action == 'status':emit(core.Session.status(root));return
     if args.action == 'stop':emit({'cancel_requested':core.Session.cancel(root)});return
     if not args.owner or not args.destination or not args.filename:
@@ -96,6 +104,9 @@ def main():
     core.validate_manifest({'version':1,'id':str(uuid.uuid4()),'name':args.filename,'bytes':0,'sha256':'0'*64},args.max_bytes)
     if args.expect_sha256 and not core.re.fullmatch('[0-9a-f]{64}',args.expect_sha256):
         p.error('Invalid expected SHA-256')
+    args.transfer_id = str(uuid.UUID(args.transfer_id)) if args.transfer_id else str(uuid.uuid4())
+    if publication.record_path(root, args.transfer_id).exists():
+        p.error('Transfer ID already exists; query result before starting a new transfer')
     args.destination = args.destination.expanduser().resolve()
     session = core.Session(root,args.timeout)
     def cancelled(*_):raise core.Cancelled('Receiver interrupted')
@@ -104,9 +115,20 @@ def main():
     try:
         with session.acquire():
             acquired = True
+            emit({'event':'started','transfer_id':args.transfer_id})
             with tempfile.TemporaryDirectory(prefix='runner-files-',dir=root) as temp:
                 scratch=Path(temp)
                 receive_saved(args,session,RunnerFiles(args,session,scratch),scratch,emit)
+    except Exception as error:
+        if getattr(session, 'publication_id', None):
+            try:
+                outcome = publication.reconcile(root, session.publication_id)
+            except Exception:
+                outcome = {'committed':None,'outcome':'unknown','transfer_id':session.publication_id}
+            emit({'event':'publication-result', **outcome, 'interrupted_by':str(error)})
+            if outcome['committed'] is True:
+                return
+        raise
     finally:
         if acquired:emit({'event':'session-ended','receiver':core.Session.status(root),'system_clipboard':'unchanged'})
 

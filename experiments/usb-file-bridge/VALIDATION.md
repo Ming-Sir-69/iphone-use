@@ -20,7 +20,7 @@ Based on upstream `a1355ab`. Private identifiers and source documents are omitte
 - No Copy action, pasteboard API, shared-pasteboard cache or Handoff-setting
   change was used. Hashes are computed on the Mac, not inside the runner.
 
-`python3 -m unittest discover -s tests -v`: **25 tests passed**. Coverage includes
+`python3 -m unittest discover -s tests -v`: **35 tests passed**. Coverage includes
 actual CLI errors/status, cancellation/locks/stale state, lease/UDID/wireless
 checks, deadlines, path/metadata/size validation, two-read disagreement, source
 changes, expected digest, idempotency, symlinks, non-overwriting publication
@@ -59,3 +59,16 @@ This closes the reproduced blocking-probe window, not every possible race:
 a status observation is not an atomic lease held across a device subprocess or
 filesystem publication. A daemon-native transaction is still required for that
 stronger guarantee.
+
+## Recoverable publication follow-up
+
+Ten additional offline tests cover cancellation immediately after a successful
+link, interrupted success-receipt delivery through the CLI, journal-completion
+failure, pre-publication abort, uncertain commit attempts, replacement/in-place
+modification of the target, ID reuse/traversal, and recovery from a separate
+process that exits immediately after linking (no Python cleanup). The new process
+can query the persisted intent and verify the destination identity and hash.
+
+These tests do not strengthen the documented owner/transport checkpoints into
+an atomic lease. Same-name lease reincarnation, source freshness and hard live
+I/O quotas still require integration with the daemon/transfer protocol.

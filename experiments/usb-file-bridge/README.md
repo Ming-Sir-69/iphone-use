@@ -65,7 +65,8 @@ Optionally favorite the folder. The local Chinese-language validation used
    ```
 
 `IPHONE_USE_OWNER` can supply `--owner`. `--expect-sha256` optionally checks a
-known sample. Maximum/default payload limit is 64 MiB. `--state-dir` relocates
+known sample. Maximum/default accepted file size is 64 MiB. This is validated after CoreDevice
+reads as well as against its initial metadata; it is not a hard download/disk quota. `--state-dir` relocates
 runtime state from `~/.iphone-use/usb-file-bridge`.
 
 The receiver lists the exact saved file, verifies size/type, reads it twice with
@@ -86,6 +87,31 @@ not a stale PID. An OS lock scopes exclusivity by UDID/bundle/instance. Agents
 should select one route per task and avoid clipboard-export flows while a USB
 receiver is active. Apple clipboard settings remain unchanged throughout;
 there is no global switch to restore after cancellation or disconnection.
+
+## Recover an interrupted publication
+
+Each receive emits a `started` event with a transfer ID (or accepts a caller's
+fresh UUID via `--transfer-id`). Before publishing a destination, the receiver
+persists an intent containing its expected size/hash, path and inode identity.
+After an interrupted command, query without touching the phone:
+
+```sh
+python3 mac/runner_files.py result \
+  --device '<udid>' --bundle '<runner>.xctrunner' --transfer-id '<uuid>'
+```
+
+Use the original instance/state-dir. The result distinguishes `committed=true`,
+`not_published`, and `unknown` (`committed=null`). A successful link followed by
+cancellation is reconciled instead of being reported as a failed copy. A hard
+process exit before the normal receipt can also be queried from the persisted
+intent. Missing/replaced/modified targets may yield unknown; do not automatically
+retry an unknown outcome. Existing transfer IDs cannot silently overwrite their
+records. A missing record is not a substitute for inspecting an interrupted task.
+
+The ID identifies the receive/publication attempt, not the originating app's Save
+transaction. This does not prove source freshness, add an atomic phone lease,
+or guarantee storage survives every hardware/power failure. Result queries are
+read-only and do not remove orphan staging paths left by a hard process kill.
 
 ## Boundaries
 

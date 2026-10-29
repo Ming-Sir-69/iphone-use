@@ -31,8 +31,17 @@ def atomic_json(path, value):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        sync_directory(path.parent)
     finally:
         Path(temporary).unlink(missing_ok=True)
+
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
 
 def read_json(path):
     if path.stat().st_size > 64 * 1024:
@@ -184,6 +193,7 @@ class Device:
 
 
 def commit_file(source, meta, destination, session, guard):
+    import publication
     destination.mkdir(parents=True, exist_ok=True)
     target = destination / meta['name']
     if target.is_symlink():
@@ -192,9 +202,13 @@ def commit_file(source, meta, destination, session, guard):
         if not target.is_file() or digest_file(target, meta['bytes']) != (meta['bytes'], meta['sha256']):
             raise TransferError('Destination differs; refusing overwrite')
         guard()
+        path, record = publication.prepare(session, meta, target, publication.identity(target, existing=True))
+        publication.mark_committed(path, record)
         return target, 'already_identical'
     fd, name = tempfile.mkstemp(prefix='.usb-', suffix='.partial', dir=destination)
     stage = Path(name)
+    path = record = None
+    attempted = False
     try:
         with os.fdopen(fd, 'wb') as output, source.open('rb') as incoming:
             while chunk := incoming.read(CHUNK):
@@ -204,16 +218,45 @@ def commit_file(source, meta, destination, session, guard):
             os.fsync(output.fileno())
         if digest_file(stage, meta['bytes']) != (meta['bytes'], meta['sha256']):
             raise TransferError('Staging file integrity mismatch')
-        guard()
-        # link() atomically refuses a race-created destination, unlike replace().
+        path, record = publication.prepare(session, meta, target, publication.identity(stage))
+        publication.mark_committing(path, record)
+        guard()  # Recheck after persisting intent as well as after the transport probe.
+        attempted = True
         os.link(stage, target)
+        sync_directory(destination)
+        publication.mark_committed(path, record)
         return target, 'copied'
+    except Exception as error:
+        if path is not None:
+            if not attempted:
+                record['state'] = 'aborted'
+                try:
+                    atomic_json(path, record)
+                except Exception:
+                    pass
+            try:
+                outcome = publication.reconcile(session.root, meta['id'])
+            except Exception:
+                outcome = {'committed': None}
+            if outcome['committed'] is True:
+                # A signal/cleanup error after link must not become a false failed copy.
+                session.publication_warning = str(error)
+                try:
+                    publication.mark_committed(path, record, warning=str(error))
+                except Exception:
+                    pass  # The durable intent still permits a later read-only result query.
+                return target, 'copied'
+        raise
     finally:
-        stage.unlink(missing_ok=True)
+        try:
+            stage.unlink(missing_ok=True)
+        except OSError as error:
+            session.publication_warning = 'Staging cleanup failed: ' + str(error)
+
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('action', choices=['receive', 'status', 'stop'])
+    p.add_argument('action', choices=['receive', 'status', 'stop', 'result'])
     p.add_argument('--device', required=True, help='Exact UDID; must match the iPhone Use instance')
     p.add_argument('--bundle', required=True, help='Exact installed XCTest runner bundle identifier')
     p.add_argument('--instance', default='default')
