@@ -1,0 +1,31 @@
+name: USBFileBridge
+settings:
+  base:
+    DEVELOPMENT_TEAM: $(IPU_BRIDGE_TEAM)
+    CODE_SIGN_STYLE: Automatic
+    IPHONEOS_DEPLOYMENT_TARGET: '17.0'
+    SWIFT_VERSION: '5.0'
+targets:
+  USBFileBridge:
+    type: application
+    platform: iOS
+    sources: [Sources]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(IPU_BRIDGE_BUNDLE_ID)
+        TARGETED_DEVICE_FAMILY: '1'
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: USB File Bridge
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+          UISceneConfigurations: {}
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: false
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Transfer File
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes: [public.data, public.content, com.adobe.pdf]
