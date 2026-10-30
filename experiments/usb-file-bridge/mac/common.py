@@ -71,16 +71,20 @@ def validate_manifest(value, max_bytes):
         raise TransferError('Invalid SHA-256')
     return {k: value[k] for k in ('version', 'id', 'name', 'bytes', 'sha256')}
 
-def digest_file(path, maximum):
+def digest_stream(stream, maximum):
     digest = hashlib.sha256()
     total = 0
-    with path.open('rb') as stream:
-        while data := stream.read(CHUNK):
-            total += len(data)
-            if total > maximum:
-                raise TransferError('File exceeds size limit')
-            digest.update(data)
+    while data := stream.read(CHUNK):
+        total += len(data)
+        if total > maximum:
+            raise TransferError('File exceeds size limit')
+        digest.update(data)
     return total, digest.hexdigest()
+
+
+def digest_file(path, maximum):
+    with path.open('rb') as stream:
+        return digest_stream(stream, maximum)
 
 class Session:
     """OS lock is authoritative; cancellation is token-based, never kill-by-PID."""

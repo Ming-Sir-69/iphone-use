@@ -26,6 +26,28 @@ def prepare(session, meta, target, identity):
     return path, record
 
 
+def file_stamp(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def verified_contents(target, expected, meta):
+    # Keep identity and digest attached to one opened regular file. A path can
+    # change independently while it is being read, so check its binding too.
+    fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        before = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(before.st_mode) or before.st_dev != expected['device']
+                or before.st_ino != expected['inode']):
+            return False
+        if file_stamp(target.lstat()) != file_stamp(before):
+            return False
+        digest = common.digest_stream(stream, meta['bytes'])
+        after = os.fstat(stream.fileno())
+        return (digest == (meta['bytes'], meta['sha256'])
+                and file_stamp(before) == file_stamp(after) == file_stamp(target.lstat()))
+
+
 def reconcile(root, transfer_id):
     """Read-only observation: never copies, removes, or retries publication."""
     record = common.read_json(record_path(root, transfer_id))
@@ -48,7 +70,7 @@ def reconcile(root, transfer_id):
     if (stat.S_ISREG(info.st_mode) and info.st_dev == expected['device']
             and info.st_ino == expected['inode']):
         try:
-            matches = common.digest_file(target, meta['bytes']) == (meta['bytes'], meta['sha256'])
+            matches = verified_contents(target, expected, meta)
         except (OSError, common.TransferError) as error:
             result['inspection_error'] = str(error)
             matches = False

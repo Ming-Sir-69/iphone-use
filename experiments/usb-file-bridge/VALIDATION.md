@@ -20,7 +20,7 @@ Based on upstream `a1355ab`. Private identifiers and source documents are omitte
 - No Copy action, pasteboard API, shared-pasteboard cache or Handoff-setting
   change was used. Hashes are computed on the Mac, not inside the runner.
 
-`python3 -m unittest discover -s tests -v`: **35 tests passed**. Coverage includes
+`python3 -m unittest discover -s tests -v`: **38 tests passed**. Coverage includes
 actual CLI errors/status, cancellation/locks/stale state, lease/UDID/wireless
 checks, deadlines, path/metadata/size validation, two-read disagreement, source
 changes, expected digest, idempotency, symlinks, non-overwriting publication
@@ -72,3 +72,18 @@ can query the persisted intent and verify the destination identity and hash.
 These tests do not strengthen the documented owner/transport checkpoints into
 an atomic lease. Same-name lease reincarnation, source freshness and hard live
 I/O quotas still require integration with the daemon/transfer protocol.
+
+
+## Descriptor-bound reconciliation follow-up
+
+Recovery now hashes the same opened regular-file descriptor whose device/inode
+matches the publication intent. It checks file metadata and the destination path
+binding before and after the read. Replacement or in-place changes during the
+inspection remain `unknown`.
+
+Three offline regressions cover replacement between identity inspection and
+hashing, replacement during hashing, and in-place modification during hashing.
+All three fail against the prior recovery code; the full 38-test suite passes
+with the descriptor-bound check. No additional phone access was used. The result
+is a read-time observation, not a promise that another process cannot change the
+file after the check completes.

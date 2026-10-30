@@ -127,4 +127,48 @@ with session.acquire():
     def test_result_id_path_traversal_refused(self):
         with self.assertRaises(ValueError):p.record_path(self.root,'../escape')
 
+
+class ReconciliationRaceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name);self.source=self.root/'source';self.source.write_bytes(b'synthetic bytes')
+        self.meta={'version':1,'id':str(uuid.uuid4()),'name':'sample.pdf','bytes':15,
+                   'sha256':hashlib.sha256(self.source.read_bytes()).hexdigest()}
+        self.session=c.Session(self.root/'state',10)
+        with self.session.acquire():self.target,_=c.commit_file(self.source,self.meta,self.root/'out',self.session,lambda:None)
+        self.target=self.target.resolve()
+
+    def test_replacement_between_identity_check_and_hash_is_unknown(self):
+        self.target.write_bytes(b'corrupted bytes')
+        original=Path.lstat;swapped=[]
+        def swap_after_stat(path,*args,**kwargs):
+            info=original(path,*args,**kwargs)
+            if path==self.target and not swapped:
+                swapped.append(True);path.rename(self.root/'old-corrupt');path.write_bytes(self.source.read_bytes())
+            return info
+        with patch.object(Path,'lstat',swap_after_stat):result=p.reconcile(self.session.root,self.meta['id'])
+        self.assertTrue(swapped)
+        self.assertIsNone(result['committed'])
+
+    def test_replacement_during_digest_is_unknown(self):
+        original=c.digest_stream;swapped=[]
+        def swap_after_read(stream,maximum):
+            result=original(stream,maximum)
+            if not swapped:
+                swapped.append(True);self.target.rename(self.root/'old-target');self.target.write_bytes(self.source.read_bytes())
+            return result
+        with patch.object(c,'digest_stream',side_effect=swap_after_read):result=p.reconcile(self.session.root,self.meta['id'])
+        self.assertTrue(swapped)
+        self.assertIsNone(result['committed'])
+
+    def test_in_place_change_during_digest_is_unknown(self):
+        original=c.digest_stream;changed=[]
+        def change_after_read(stream,maximum):
+            result=original(stream,maximum)
+            changed.append(True);self.target.write_bytes(b'changed during the digest')
+            return result
+        with patch.object(c,'digest_stream',side_effect=change_after_read):result=p.reconcile(self.session.root,self.meta['id'])
+        self.assertTrue(changed)
+        self.assertIsNone(result['committed'])
+
 if __name__=='__main__':unittest.main()
